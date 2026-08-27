@@ -15,7 +15,6 @@
 package platform
 
 import (
-	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -47,14 +46,21 @@ func (*MMapMinAddr) MinUserAddress() hostarch.Addr {
 
 func init() {
 	// Open the source file.
+	//
+	// [froot 补丁 0001] Android(untrusted_app/shell 域)上该文件被
+	// SELinux 拒绝读取(EACCES),而 mmap_min_addr 只用于低地址 hint 的
+	// 下界:读不到时退回保守默认 4096,而不是 panic(见 froot 主仓
+	// docs/adr/0013)。
 	b, err := os.ReadFile(systemMMapMinAddrSource)
 	if err != nil {
-		panic(fmt.Sprintf("couldn't open %s: %v", systemMMapMinAddrSource, err))
+		systemMMapMinAddr = 4096
+		return
 	}
 
 	// Parse the result.
 	systemMMapMinAddr, err = strconv.ParseUint(strings.TrimSpace(string(b)), 10, 64)
 	if err != nil {
-		panic(fmt.Sprintf("couldn't parse %s from %s: %v", string(b), systemMMapMinAddrSource, err))
+		systemMMapMinAddr = 4096
+		return
 	}
 }
