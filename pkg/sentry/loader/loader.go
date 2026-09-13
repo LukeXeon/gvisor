@@ -63,6 +63,24 @@ type LoadArgs struct {
 	// The caller is responsible for checking that the user can execute this file.
 	File *vfs.FileDescription
 
+	// ExecFD, if non-nil, is installed into the task's FD table at exec
+	// commit (lowest free FD, no O_CLOEXEC) and reported to the new image
+	// via AT_EXECFD. Set by binfmt_misc rewrites with the O/C flags
+	// (Linux fs/binfmt_misc.c: bprm->executable). (rosetta 补丁 0020)
+	ExecFD *vfs.FileDescription
+
+	// CredsFromBinary indicates that exec credentials are computed from
+	// the binary (ExecFD) instead of the interpreter file (binfmt_misc
+	// C flag; Linux fs/exec.c: bprm->execfd_creds). (rosetta 补丁 0020)
+	CredsFromBinary bool
+
+	// synthesize, if non-nil, short-circuits loading: the matched
+	// binfmt_misc entry synthesizes the new image directly instead of
+	// executing an interpreter file. Installed only by kernel-integrated
+	// entries; guest-registered entries always execute their interpreter.
+	// (rosetta 补丁 0020)
+	synthesize SynthesizeFunc
+
 	// Root is the current filesystem root.
 	Root vfs.VirtualDentry
 
@@ -102,6 +120,57 @@ type LoadArgs struct {
 	// Only set when loading the initial task image of the root container.
 	StartupTimeline *timing.Timeline
 }
+
+// SynthesizeFunc builds the new process image for a binfmt_misc entry
+// that is handled directly by its registrar instead of by executing an
+// interpreter file (rosetta 补丁 0020). It is called from Load with the
+// working LoadArgs (MemoryManager is already set; Filename/Argv are the
+// original, unrewritten values) and the open target file, and returns the
+// image, post-exec credentials and secure-exec flag exactly as Load would.
+type SynthesizeFunc func(ctx context.Context, args LoadArgs, file *vfs.FileDescription) (ImageInfo, *auth.Credentials, bool, *syserr.Error)
+
+// BinfmtMiscMatch describes a binfmt_misc interpreter rewrite.
+// (rosetta 补丁 0020; semantics: Linux fs/binfmt_misc.c:load_misc_binary)
+type BinfmtMiscMatch struct {
+	// Interpreter is the interpreter path (the rewritten load target).
+	Interpreter string
+
+	// InterpFile, if non-nil, is loaded instead of opening Interpreter
+	// (F flag: file pinned at registration time). Ownership is
+	// transferred to the loader.
+	InterpFile *vfs.FileDescription
+
+	// Argv is the rewritten argument vector (P/O flag semantics applied).
+	Argv []string
+
+	// ExecFD, if non-nil (O/C flags), is installed into the task's FD
+	// table at exec commit (lowest free FD, no O_CLOEXEC) and reported
+	// to the new image via AT_EXECFD. Ownership is transferred to the
+	// loader.
+	ExecFD *vfs.FileDescription
+
+	// CredsFromBinary indicates that exec credentials are computed from
+	// the binary (ExecFD) instead of the interpreter (C flag).
+	CredsFromBinary bool
+
+	// Synthesize, if non-nil, marks the entry as registrar-handled: the
+	// image is synthesized directly (no interpreter execution, no argv
+	// rewrite). Only kernel-integrated entries may set this; matches from
+	// guest-registered entries always leave it nil.
+	Synthesize SynthesizeFunc
+}
+
+// BinfmtMiscHook matches a file against the binfmt_misc registry. It is
+// installed by the binfmt_misc subsystem at kernel setup; nil means no
+// binfmt_misc support. (rosetta 补丁 0020)
+//
+// header holds the bytes read from the head of the file being loaded (up
+// to 256, Linux BINPRM_BUF_SIZE); filename is the current-level path
+// (Linux bprm->interp); argv is the current argument vector; file is the
+// open executable. A nil match with nil error means "no registered entry
+// matched" (loading continues to the next format); a non-nil error aborts
+// the exec (Linux: any handler error other than -ENOEXEC aborts).
+var BinfmtMiscHook func(ctx context.Context, header []byte, filename string, argv []string, file *vfs.FileDescription) (*BinfmtMiscMatch, error)
 
 // openPath opens args.Filename and checks that it is valid for loading.
 //
@@ -175,84 +244,153 @@ const (
 	maxLoaderAttempts = 6
 )
 
-// loadExecutable loads an executable that is pointed to by args.File. The
+// loadExecutable loads an executable that is pointed to by out.File. The
 // caller is responsible for checking that the user can execute this file.
-// If nil, the path args.Filename is resolved and loaded (check that the user
+// If nil, the path out.Filename is resolved and loaded (check that the user
 // can execute this file is done here in this case). If the executable is an
-// interpreter script rather than an ELF, the binary of the corresponding
-// interpreter will be loaded.
+// interpreter script or matches a binfmt_misc entry, the binary of the
+// corresponding interpreter will be loaded instead. (rosetta 补丁 0020:
+// the working LoadArgs is returned on success; it carries the rewritten
+// argv and any binfmt_misc side effects (ExecFD/CredsFromBinary). The
+// caller's own copy keeps the original Filename for AT_EXECFN/comm,
+// matching Linux's bprm->filename.)
 //
 // It returns:
 //   - loadedELF, description of the loaded binary
 //   - arch.Context64 matching the binary arch
 //   - fs.Dirent of the binary file
-//   - Possibly updated args.Argv
-func loadExecutable(ctx context.Context, args LoadArgs) (loadedELF, *arch.Context64, *vfs.FileDescription, []string, error) {
+//   - Possibly updated LoadArgs
+func loadExecutable(ctx context.Context, args LoadArgs) (loaded loadedELF, ac *arch.Context64, file *vfs.FileDescription, out LoadArgs, err error) {
+	out = args
+	defer func() {
+		if err != nil && out.ExecFD != nil {
+			out.ExecFD.DecRef(ctx)
+			out.ExecFD = nil
+		}
+	}()
 	for i := 0; i < maxLoaderAttempts; i++ {
-		if args.File == nil {
-			var err error
-			args.File, err = openPath(ctx, args)
+		if out.File == nil {
+			out.File, err = openPath(ctx, out)
 			if err != nil {
 				// ENOENT is common for runtimes that try to exec many locations on PATH (e.g Python).
 				// Don't log those errors to avoid spam.
 				if !errors.Is(err, linuxerr.ENOENT) {
-					ctx.Infof("Error opening %s: %v", args.Filename, err)
+					ctx.Infof("Error opening %s: %v", out.Filename, err)
 				}
-				return loadedELF{}, nil, nil, nil, err
+				return loadedELF{}, nil, nil, LoadArgs{}, err
 			}
 			// Ensure file is release in case the code loops or errors out.
-			defer args.File.DecRef(ctx)
+			defer out.File.DecRef(ctx)
 		} else {
-			if err := checkIsRegularFile(ctx, args.File, args.Filename); err != nil {
-				return loadedELF{}, nil, nil, nil, err
+			if err = checkIsRegularFile(ctx, out.File, out.Filename); err != nil {
+				return loadedELF{}, nil, nil, LoadArgs{}, err
 			}
 		}
 
-		// Check the header. Is this an ELF or interpreter script?
-		var hdr [4]uint8
+		// Check the header: binfmt_misc match, ELF, or interpreter script?
+		// Linux reads BINPRM_BUF_SIZE (256) bytes per rewrite level
+		// (fs/exec.c:prepare_binprm); binfmt_misc magic matching needs the
+		// same window. (rosetta 补丁 0020)
+		var hdr [256]uint8
 		// N.B. We assume that reading from a regular file cannot block.
-		_, err := args.File.ReadFull(ctx, usermem.BytesIOSequence(hdr[:]), 0)
+		var n int64
+		n, err = out.File.ReadFull(ctx, usermem.BytesIOSequence(hdr[:]), 0)
 		// Allow unexpected EOF, as a valid executable could be only three bytes
 		// (e.g., #!a).
 		if err != nil && err != io.ErrUnexpectedEOF {
 			if err == io.EOF {
 				err = linuxerr.ENOEXEC
 			}
-			return loadedELF{}, nil, nil, nil, err
+			return loadedELF{}, nil, nil, LoadArgs{}, err
+		}
+		head := hdr[:n]
+
+		// binfmt_misc is tried first: Linux's insert_binfmt() inserts it
+		// at the head of the formats list. A match rewrites the load
+		// target to the registered interpreter and loops. (rosetta 补丁 0020)
+		if BinfmtMiscHook != nil {
+			var match *BinfmtMiscMatch
+			match, err = BinfmtMiscHook(ctx, head, out.Filename, out.Argv, out.File)
+			if err != nil {
+				return loadedELF{}, nil, nil, LoadArgs{}, err
+			}
+			if match != nil {
+				if out.CloseOnExec {
+					// Linux fs/binfmt_misc.c:load_misc_binary() fails
+					// with ENOENT when the binary's path becomes
+					// inaccessible after exec.
+					return loadedELF{}, nil, nil, LoadArgs{}, linuxerr.ENOENT
+				}
+				if match.Synthesize != nil {
+					// Registrar-handled entry: the image is synthesized
+					// directly from the original file/argv (no rewrite,
+					// no interpreter execution). The target file stays
+					// open for the synthesizer (credentials, exe link).
+					out.synthesize = match.Synthesize
+					out.File.IncRef()
+					return loadedELF{}, nil, out.File, out, nil
+				}
+				out.Filename = match.Interpreter
+				out.Argv = match.Argv
+				if match.ExecFD != nil {
+					if out.ExecFD != nil {
+						// Linux exec_binprm(): a second execfd level
+						// (bprm->executable already set) is a hard
+						// ENOEXEC.
+						match.ExecFD.DecRef(ctx)
+						return loadedELF{}, nil, nil, LoadArgs{}, linuxerr.ENOEXEC
+					}
+					out.ExecFD = match.ExecFD
+				}
+				if match.CredsFromBinary {
+					// bprm->execfd_creds is only ever set, never cleared,
+					// across rewrite levels.
+					out.CredsFromBinary = true
+				}
+				if match.InterpFile != nil {
+					defer match.InterpFile.DecRef(ctx)
+					out.File = match.InterpFile
+				} else {
+					out.File = nil
+				}
+				// Refresh the traversal limit for the interpreter.
+				*out.RemainingTraversals = linux.MaxSymlinkTraversals
+				continue
+			}
 		}
 
 		switch {
-		case bytes.Equal(hdr[:], []byte(elfMagic)):
-			loaded, ac, err := loadELF(ctx, args)
+		case n >= int64(len(elfMagic)) && bytes.Equal(head[:len(elfMagic)], []byte(elfMagic)):
+			loaded, ac, err := loadELF(ctx, out)
 			if err != nil {
 				ctx.Infof("Error loading ELF: %v", err)
-				return loadedELF{}, nil, nil, nil, err
+				return loadedELF{}, nil, nil, LoadArgs{}, err
 			}
 			// An ELF is always terminal. Hold on to file.
-			args.File.IncRef()
-			return loaded, ac, args.File, args.Argv, err
+			out.File.IncRef()
+			return loaded, ac, out.File, out, err
 
-		case bytes.Equal(hdr[:2], []byte(interpreterScriptMagic)):
-			if args.CloseOnExec {
-				return loadedELF{}, nil, nil, nil, linuxerr.ENOENT
+		case n >= 2 && bytes.Equal(head[:2], []byte(interpreterScriptMagic)):
+			if out.CloseOnExec {
+				return loadedELF{}, nil, nil, LoadArgs{}, linuxerr.ENOENT
 			}
-			args.Filename, args.Argv, err = parseInterpreterScript(ctx, args.Filename, args.File, args.Argv)
+			out.Filename, out.Argv, err = parseInterpreterScript(ctx, out.Filename, out.File, out.Argv)
 			if err != nil {
 				ctx.Infof("Error loading interpreter script: %v", err)
-				return loadedELF{}, nil, nil, nil, err
+				return loadedELF{}, nil, nil, LoadArgs{}, err
 			}
 			// Refresh the traversal limit for the interpreter.
-			*args.RemainingTraversals = linux.MaxSymlinkTraversals
+			*out.RemainingTraversals = linux.MaxSymlinkTraversals
 
 		default:
-			ctx.Infof("Unknown magic: %v", hdr)
-			return loadedELF{}, nil, nil, nil, linuxerr.ENOEXEC
+			ctx.Infof("Unknown magic: %v", head)
+			return loadedELF{}, nil, nil, LoadArgs{}, linuxerr.ENOEXEC
 		}
 		// Set to nil in case we loop on a Interpreter Script.
-		args.File = nil
+		out.File = nil
 	}
 
-	return loadedELF{}, nil, nil, nil, linuxerr.ELOOP
+	return loadedELF{}, nil, nil, LoadArgs{}, linuxerr.ELOOP
 }
 
 // ImageInfo represents the information for the loaded image.
@@ -263,6 +401,15 @@ type ImageInfo struct {
 	Arch *arch.Context64
 	// The base name of the binary.
 	Name string
+
+	// ExecFD, if non-nil, is installed into the task's FD table at exec
+	// commit; the FD number is patched into the auxv entry at
+	// ExecFDValueAddr (binfmt_misc O/C flags). Ownership is transferred
+	// to the caller. (rosetta 补丁 0020)
+	ExecFD *vfs.FileDescription
+	// ExecFDValueAddr is the guest address of the AT_EXECFD auxv value
+	// to patch at exec commit.
+	ExecFDValueAddr hostarch.Addr
 }
 
 // Load loads args.File into a MemoryManager. If args.File is nil, the path
@@ -278,11 +425,26 @@ type ImageInfo struct {
 //   - Load is called on the Task goroutine.
 func Load(ctx context.Context, args LoadArgs, extraAuxv []arch.AuxEntry, vdso *VDSO) (ImageInfo, *auth.Credentials, bool, *syserr.Error) {
 	// Load the executable itself.
-	loaded, ac, file, newArgv, err := loadExecutable(ctx, args)
+	loaded, ac, file, loadOut, err := loadExecutable(ctx, args)
 	if err != nil {
 		return ImageInfo{}, nil, false, syserr.NewDynamic(fmt.Sprintf("failed to load %s: %v", args.Filename, err), syserr.FromError(err).ToLinux())
 	}
 	defer file.DecRef(ctx)
+	// A registrar-handled binfmt_misc entry synthesizes the image
+	// directly, short-circuiting the rest of Load. (rosetta 补丁 0020)
+	if loadOut.synthesize != nil {
+		return loadOut.synthesize(ctx, loadOut, file)
+	}
+	newArgv := loadOut.Argv
+	// A binfmt_misc rewrite with O/C flags hands us the binary to install
+	// at exec commit; on any failure below it must be released.
+	// (rosetta 补丁 0020)
+	execFD := loadOut.ExecFD
+	defer func() {
+		if execFD != nil {
+			execFD.DecRef(ctx)
+		}
+	}()
 	args.StartupTimeline.Reached("executable loaded")
 
 	// Load the VDSO.
@@ -324,11 +486,18 @@ func Load(ctx context.Context, args LoadArgs, extraAuxv []arch.AuxEntry, vdso *V
 	}
 	random := stack.Bottom
 
-	filePrivs, err := file.GetFilePrivileges(ctx)
+	// binfmt_misc C flag: compute credentials from the binary instead of
+	// the interpreter (Linux fs/exec.c: bprm->execfd_creds selects
+	// bprm->executable). (rosetta 补丁 0020)
+	credsFile := file
+	if loadOut.CredsFromBinary && loadOut.ExecFD != nil {
+		credsFile = loadOut.ExecFD
+	}
+	filePrivs, err := credsFile.GetFilePrivileges(ctx)
 	if err != nil {
 		return ImageInfo{}, nil, false, syserr.NewDynamic(fmt.Sprintf("failed to read file privileges of %s: %v", args.Filename, err), syserr.FromError(err).ToLinux())
 	}
-	c, secureExec, err := auth.ComputeCredsForExec(auth.CredentialsFromContext(ctx), filePrivs, file.MappedName(ctx),
+	c, secureExec, err := auth.ComputeCredsForExec(auth.CredentialsFromContext(ctx), filePrivs, credsFile.MappedName(ctx),
 		args.NoNewPrivs, args.StopPrivGain, args.AllowSUID)
 	if err != nil {
 		return ImageInfo{}, nil, false, syserr.NewDynamic(fmt.Sprintf("failed to update creds with file privileges: %v", err), syserr.FromError(err).ToLinux())
@@ -354,6 +523,16 @@ func Load(ctx context.Context, args LoadArgs, extraAuxv []arch.AuxEntry, vdso *V
 		arch.AuxEntry{linux.AT_HWCAP2, hostarch.Addr(args.Features.AllowedHWCap2())},
 	}...)
 
+	// binfmt_misc O flag: report the binary's FD (installed at exec
+	// commit) via AT_EXECFD; the value is patched in place once the FD
+	// number is known (Linux fs/binfmt_elf.c: NEW_AUX_ENT(AT_EXECFD,
+	// bprm->execfd)). (rosetta 补丁 0020)
+	execFDEntry := -1
+	if loadOut.ExecFD != nil {
+		auxv = append(auxv, arch.AuxEntry{linux.AT_EXECFD, 0})
+		execFDEntry = len(auxv) - 1
+	}
+
 	sl, err := stack.Load(newArgv, args.Envv, auxv)
 	if err != nil {
 		return ImageInfo{}, nil, false, syserr.NewDynamic(fmt.Sprintf("Failed to load stack: %v", err), syserr.FromError(err).ToLinux())
@@ -377,9 +556,17 @@ func Load(ctx context.Context, args LoadArgs, extraAuxv []arch.AuxEntry, vdso *V
 		name = name[:linux.TASK_COMM_LEN-1]
 	}
 
-	return ImageInfo{
+	info := ImageInfo{
 		OS:   loaded.os,
 		Arch: ac,
 		Name: name,
-	}, c, secureExec, nil
+	}
+	if execFDEntry >= 0 {
+		// Auxv entries are pairs of hostarch.Addr values; the FD number
+		// goes into the value slot of the AT_EXECFD entry.
+		info.ExecFD = execFD
+		info.ExecFDValueAddr = sl.AuxvStart + hostarch.Addr(uint(execFDEntry)*2*ac.Width()+ac.Width())
+		execFD = nil // ownership transferred to info
+	}
+	return info, c, secureExec, nil
 }

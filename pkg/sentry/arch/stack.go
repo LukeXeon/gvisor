@@ -131,6 +131,9 @@ type StackLayout struct {
 
 	// EnvvEnd is the end of the environment vector.
 	EnvvEnd hostarch.Addr
+
+	// AuxvStart is the beginning of the auxiliary vector. (rosetta 补丁 0020)
+	AuxvStart hostarch.Addr
 }
 
 // Load pushes the given args, env and aux vector to the stack using the
@@ -199,6 +202,7 @@ func (s *Stack) Load(args []string, env []string, aux Auxv) (StackLayout, error)
 	if err != nil {
 		return StackLayout{}, err
 	}
+	l.AuxvStart = s.Bottom
 
 	// Push environment.
 	_, err = s.pushAddrSliceAndTerminator(envAddrs)

@@ -24,6 +24,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel/futex"
 	"gvisor.dev/gvisor/pkg/sentry/loader"
 	"gvisor.dev/gvisor/pkg/sentry/mm"
+	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/syserr"
 )
 
@@ -50,6 +51,15 @@ type TaskImage struct {
 
 	// st is the task's syscall table.
 	st *SyscallTable `state:".(syscallTableInfo)"`
+
+	// execFD, if non-nil, is installed into the task's FD table at exec
+	// commit (binfmt_misc O/C flags); the FD number is patched into the
+	// auxv entry at execFDValueAddr. Transient: consumed at commit.
+	// (rosetta 补丁 0020)
+	execFD *vfs.FileDescription
+
+	// execFDValueAddr is the guest address of the AT_EXECFD auxv value.
+	execFDValueAddr hostarch.Addr
 }
 
 // release releases all resources held by the TaskImage. release is called by
@@ -60,6 +70,10 @@ func (image *TaskImage) release(ctx context.Context) {
 	if image.MemoryManager != nil {
 		image.MemoryManager.DecUsers(ctx)
 		image.MemoryManager = nil
+	}
+	if image.execFD != nil {
+		image.execFD.DecRef(ctx)
+		image.execFD = nil
 	}
 	image.fu = nil
 }
@@ -166,10 +180,12 @@ func (k *Kernel) LoadTaskImage(ctx context.Context, args loader.LoadArgs) (*Task
 		panic("Failed to increment users count on new MM")
 	}
 	return &TaskImage{
-		Name:          info.Name,
-		Arch:          info.Arch,
-		MemoryManager: m,
-		fu:            k.futexes.Fork(),
-		st:            st,
+		Name:            info.Name,
+		Arch:            info.Arch,
+		MemoryManager:   m,
+		fu:              k.futexes.Fork(),
+		st:              st,
+		execFD:          info.ExecFD,
+		execFDValueAddr: info.ExecFDValueAddr,
 	}, creds, secureExec, nil
 }
