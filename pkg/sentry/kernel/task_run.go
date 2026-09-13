@@ -278,11 +278,14 @@ func (app *runApp) execute(t *Task) taskRunState {
 			addr := hostarch.Addr(info.Addr())
 			err := t.MemoryManager().HandleUserFault(t, addr, at, hostarch.Addr(t.Arch().Stack()))
 			region.End()
+			/* [rosetta 诊断(X64-LOAD):fault 裁决留痕,收官即摘] */
 			if err == nil {
+				t.Infof("[rosetta][fault] addr=%#x at=%v -> 提交重试", addr, at)
 				// The fault was handled appropriately.
 				// We can resume running the application.
 				return (*runApp)(nil)
 			}
+			t.Infof("[rosetta][fault] addr=%#x at=%v -> 信号路径 err=%v", addr, at, err)
 
 			// Is this a vsyscall that we need emulate?
 			//
