@@ -81,6 +81,11 @@ func (fs *filesystem) newSysDir(ctx context.Context, root *auth.Credentials, k *
 		"fs": fs.newStaticDir(ctx, root, map[string]kernfs.Inode{
 			"nr_open":       fs.newInode(ctx, root, 0644, &atomicInt32File{val: &k.MaxFDLimit, min: 8, max: kernel.MaxFdLimit}),
 			"pipe-max-size": fs.newInode(ctx, root, 0644, newStaticFile(fmt.Sprintf("%d\n", pipe.MaximumPipeSize))),
+			// binfmt_misc 挂载点目录(Linux fs/file_table.c:
+			// register_sysctl_mount_point("fs/binfmt_misc")——目录恒
+			// 在,与 binfmt_misc 文件系统是否已挂载无关)。
+			// (rosetta 补丁 0021)
+			"binfmt_misc": fs.newStaticDir(ctx, root, map[string]kernfs.Inode{}),
 		}),
 		"vm": fs.newStaticDir(ctx, root, map[string]kernfs.Inode{
 			"max_map_count":     fs.newInode(ctx, root, 0444, newStaticFile("2147483647\n")),
