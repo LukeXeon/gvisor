@@ -229,6 +229,14 @@ func Madvise(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr
 		// TODO(b/72045799): Core dumping isn't implemented, so these are
 		// no-ops.
 		fallthrough
+	case linux.MADV_WIPEONFORK:
+		// (rosetta 补丁 0022) 接受但不实现擦除语义:bionic(Android 12+)
+		// 的 arc4random 初始化对本调用硬失败即 abort——一切 bionic 动态
+		// guest 的生死门。上游(同版本/master)恒 EINVAL = bionic guest
+		// 不可引导。语义缺口在案:fork 子代不擦除该区间(arc4random
+		// PRNG 状态父子共享;加固类语义,非功能正确性),真实擦除实现
+		// 待真实消费者出现再立项。
+		return 0, nil, nil
 	case linux.MADV_NORMAL, linux.MADV_RANDOM, linux.MADV_SEQUENTIAL, linux.MADV_WILLNEED:
 		// Do nothing, we totally ignore the suggestions above.
 		return 0, nil, nil
