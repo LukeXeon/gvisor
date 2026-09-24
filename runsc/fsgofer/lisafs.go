@@ -76,6 +76,10 @@ type Config struct {
 
 	// Gofer process's EGID.
 	EGID int
+
+	XattrProvider XattrProvider
+
+	DisableXattrMessages bool
 }
 
 var procSelfFD *rwfd.FD
@@ -152,6 +156,7 @@ func (i *connectionImpl) Mount(c *lisafs.Connection, mountNode *lisafs.Node) (*l
 		hostFD:         rootHostFD,
 		writableHostFD: atomicbitops.FromInt32(-1),
 		isMountPoint:   true,
+		xattrs:         i.config.XattrProvider,
 	}
 	mountNode.IncRef() // Ref is transferred to ControlFD.
 	rootFD.ControlFD.Init(c, mountNode, linux.FileMode(stat.Mode), rootFD)
@@ -166,7 +171,7 @@ func (i *connectionImpl) MaxMessageSize() uint32 {
 // SupportedMessages implements lisafs.ConnectionImpl.SupportedMessages.
 func (i *connectionImpl) SupportedMessages() []lisafs.MID {
 	// Note that Flush is not supported.
-	return []lisafs.MID{
+	supported := []lisafs.MID{
 		lisafs.Mount,
 		lisafs.Channel,
 		lisafs.FStat,
@@ -200,6 +205,18 @@ func (i *connectionImpl) SupportedMessages() []lisafs.MID {
 		lisafs.ConnectWithCreds,
 		lisafs.RenameAt2,
 	}
+	if i.config.DisableXattrMessages {
+		filtered := make([]lisafs.MID, 0, len(supported))
+		for _, m := range supported {
+			switch m {
+			case lisafs.FGetXattr, lisafs.FSetXattr, lisafs.FListXattr, lisafs.FRemoveXattr:
+				continue
+			}
+			filtered = append(filtered, m)
+		}
+		return filtered
+	}
+	return supported
 }
 
 // controlFDLisa implements lisafs.ControlFDImpl.
@@ -217,6 +234,8 @@ type controlFDLisa struct {
 	// isMountpoint indicates whether this FD represents the mount point for its
 	// owning connection. isMountPoint is immutable.
 	isMountPoint bool
+
+	xattrs XattrProvider
 }
 
 var _ lisafs.ControlFDImpl = (*controlFDLisa)(nil)
@@ -249,6 +268,7 @@ func newControlFDLisa(hostFD int, parent *controlFDLisa, name string, mode linux
 	})
 	childFD.hostFD = hostFD
 	childFD.writableHostFD = atomicbitops.FromInt32(-1)
+	childFD.xattrs = parent.xattrs
 	childFD.ControlFD.Init(parent.Conn(), childNode, mode, childFD)
 	return childFD
 }
@@ -638,6 +658,10 @@ func (fd *controlFDLisa) OpenCreate(mode linux.FileMode, uid lisafs.UID, gid lis
 		hostOpenFD = dupFD
 	}
 
+	if fd.xattrs != nil {
+		fd.xattrs.NotifyInodeCreated(fileID(childStat))
+	}
+
 	return childFD.FD(), childStat, newFD.FD(), hostOpenFD, nil
 }
 
@@ -674,6 +698,11 @@ func (fd *controlFDLisa) Mkdir(mode linux.FileMode, uid lisafs.UID, gid lisafs.G
 	}
 
 	cu.Release()
+
+	if fd.xattrs != nil {
+		fd.xattrs.NotifyInodeCreated(fileID(childDirStat))
+	}
+
 	return newControlFDLisa(childDirFd, fd, name, linux.ModeDirectory).FD(), childDirStat, nil
 }
 
@@ -727,6 +756,10 @@ func (fd *controlFDLisa) Mknod(mode linux.FileMode, uid lisafs.UID, gid lisafs.G
 	}
 	cu.Release()
 
+	if fd.xattrs != nil {
+		fd.xattrs.NotifyInodeCreated(fileID(childStat))
+	}
+
 	return newControlFDLisa(childFD, fd, name, mode).FD(), childStat, nil
 }
 
@@ -759,6 +792,11 @@ func (fd *controlFDLisa) Symlink(name string, target string, uid lisafs.UID, gid
 		return nil, lisafs.Statx{}, err
 	}
 	cu.Release()
+
+	if fd.xattrs != nil {
+		fd.xattrs.NotifyInodeCreated(fileID(symlinkStat))
+	}
+
 	return newControlFDLisa(symlinkFD, fd, name, linux.ModeSymlink).FD(), symlinkStat, nil
 }
 
@@ -1030,6 +1068,18 @@ func (fd *controlFDLisa) BindAt(name string, sockType uint32, mode linux.FileMod
 
 // Unlink implements lisafs.ControlFDImpl.Unlink.
 func (fd *controlFDLisa) Unlink(name string, flags uint32) error {
+	if fd.xattrs != nil {
+		var st unix.Stat_t
+		if err := unix.Fstatat(fd.hostFD, name, &st, unix.AT_SYMLINK_NOFOLLOW); err == nil {
+			if err := unix.Unlinkat(fd.hostFD, name, int(flags)); err != nil {
+				return err
+			}
+			if flags&unix.AT_REMOVEDIR != 0 || st.Nlink == 1 {
+				fd.xattrs.NotifyInodeUnlinked(uint64(st.Dev), st.Ino)
+			}
+			return nil
+		}
+	}
 	return unix.Unlinkat(fd.hostFD, name, int(flags))
 }
 
@@ -1048,8 +1098,23 @@ func (fd *controlFDLisa) Renamed() {
 	// controlFDLisa does not have any state to update on rename.
 }
 
+func (fd *controlFDLisa) hostFile() HostFile {
+	return HostFile{
+		FD:    fd.hostFD,
+		Path:  fd.Node().FilePath(),
+		OPath: fd.IsSocket() || fd.IsSymlink(),
+	}
+}
+
+func fileID(st lisafs.Statx) (uint64, uint64) {
+	return unix.Mkdev(st.DevMajor, st.DevMinor), st.Ino
+}
+
 // GetXattr implements lisafs.ControlFDImpl.GetXattr.
 func (fd *controlFDLisa) GetXattr(name string, size uint32, getValueBuf func(uint32) []byte) (uint16, error) {
+	if fd.xattrs != nil {
+		return fd.xattrs.Get(fd.hostFile(), name, size, getValueBuf)
+	}
 	// getxattr(2) called with size 0 should return the attribute size. As a
 	// result, we need to return the entire attribute here so that the sentry
 	// can return the correct value.
@@ -1069,6 +1134,9 @@ func (fd *controlFDLisa) GetXattr(name string, size uint32, getValueBuf func(uin
 
 // SetXattr implements lisafs.ControlFDImpl.SetXattr.
 func (fd *controlFDLisa) SetXattr(name string, value string, flags uint32) error {
+	if fd.xattrs != nil {
+		return fd.xattrs.Set(fd.hostFile(), name, value, flags)
+	}
 	if fd.IsSocket() || fd.IsSymlink() {
 		// Sockets and symlinks use O_PATH host FDs. However, fsetxattr(2) fails
 		// with EBADF for O_PATH FDs. Use lsetxattr(2) instead.
@@ -1095,6 +1163,9 @@ var listXattrBufPool = sync.Pool{
 
 // ListXattr implements lisafs.ControlFDImpl.ListXattr.
 func (fd *controlFDLisa) ListXattr(size uint64) (lisafs.StringArray, error) {
+	if fd.xattrs != nil {
+		return fd.xattrs.List(fd.hostFile(), size)
+	}
 	// listxattr(2) called with size 0 should return the list size. As a result,
 	// we need to return the entire list here so that the sentry can return the
 	// correct value.
@@ -1123,6 +1194,9 @@ func (fd *controlFDLisa) ListXattr(size uint64) (lisafs.StringArray, error) {
 
 // RemoveXattr implements lisafs.ControlFDImpl.RemoveXattr.
 func (fd *controlFDLisa) RemoveXattr(name string) error {
+	if fd.xattrs != nil {
+		return fd.xattrs.Remove(fd.hostFile(), name)
+	}
 	if fd.IsSocket() || fd.IsSymlink() {
 		// Sockets and symlinks use O_PATH host FDs. However, fremovexattr(2) fails
 		// with EBADF for O_PATH FDs. Use lremovexattr(2) instead.
