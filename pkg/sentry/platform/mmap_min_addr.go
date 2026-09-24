@@ -15,7 +15,6 @@
 package platform
 
 import (
-	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -49,12 +48,14 @@ func init() {
 	// Open the source file.
 	b, err := os.ReadFile(systemMMapMinAddrSource)
 	if err != nil {
-		panic(fmt.Sprintf("couldn't open %s: %v", systemMMapMinAddrSource, err))
+		systemMMapMinAddr = 4096
+		return
 	}
 
 	// Parse the result.
 	systemMMapMinAddr, err = strconv.ParseUint(strings.TrimSpace(string(b)), 10, 64)
 	if err != nil {
-		panic(fmt.Sprintf("couldn't parse %s from %s: %v", string(b), systemMMapMinAddrSource, err))
+		systemMMapMinAddr = 4096
+		return
 	}
 }
