@@ -65,9 +65,12 @@ package kernel
 // """
 
 import (
+	"encoding/binary"
+
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/overlay"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/tmpfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
@@ -77,6 +80,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/syserr"
+	"gvisor.dev/gvisor/pkg/usermem"
 
 	pb "gvisor.dev/gvisor/pkg/sentry/seccheck/points/points_go_proto"
 )
@@ -353,6 +357,32 @@ func (r *runExecveAfterSiblingExitStop) execute(t *Task) taskRunState {
 	t.fdTable.RemoveIf(t, func(_ *vfs.FileDescription, flags FDFlags) bool {
 		return flags.CloseOnExec
 	})
+
+	if r.image.execFD != nil {
+		execFDFile := r.image.execFD
+		r.image.execFD = nil
+		newFD, err := t.fdTable.NewFD(t, 0, execFDFile, FDFlags{})
+		execFDFile.DecRef(t)
+		if err != nil {
+			r.image.release(t)
+			return t.doSyscallError(err)
+		}
+		m := r.image.MemoryManager
+		var buf [8]byte
+		binary.LittleEndian.PutUint64(buf[:], uint64(newFD))
+		if _, err := m.CopyOut(t, r.image.execFDValueAddr, buf[:], usermem.IOOpts{}); err != nil {
+			r.image.release(t)
+			return t.doSyscallError(err)
+		}
+		auxv := m.Auxv()
+		for i := range auxv {
+			if auxv[i].Key == linux.AT_EXECFD {
+				auxv[i].Value = hostarch.Addr(newFD)
+				break
+			}
+		}
+		m.SetAuxv(auxv)
+	}
 
 	// Handle the robust futex list.
 	t.exitRobustList()

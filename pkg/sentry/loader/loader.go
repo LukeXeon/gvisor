@@ -63,6 +63,12 @@ type LoadArgs struct {
 	// The caller is responsible for checking that the user can execute this file.
 	File *vfs.FileDescription
 
+	ExecFD *vfs.FileDescription
+
+	CredsFromBinary bool
+
+	synthesize SynthesizeFunc
+
 	// Root is the current filesystem root.
 	Root vfs.VirtualDentry
 
@@ -102,6 +108,24 @@ type LoadArgs struct {
 	// Only set when loading the initial task image of the root container.
 	StartupTimeline *timing.Timeline
 }
+
+type SynthesizeFunc func(ctx context.Context, args LoadArgs, file *vfs.FileDescription) (ImageInfo, *auth.Credentials, bool, *syserr.Error)
+
+type BinfmtMiscMatch struct {
+	Interpreter string
+
+	InterpFile *vfs.FileDescription
+
+	Argv []string
+
+	ExecFD *vfs.FileDescription
+
+	CredsFromBinary bool
+
+	Synthesize SynthesizeFunc
+}
+
+var BinfmtMiscHook func(ctx context.Context, header []byte, filename string, argv []string, file *vfs.FileDescription) (*BinfmtMiscMatch, error)
 
 // openPath opens args.Filename and checks that it is valid for loading.
 //
@@ -187,72 +211,115 @@ const (
 //   - arch.Context64 matching the binary arch
 //   - fs.Dirent of the binary file
 //   - Possibly updated args.Argv
-func loadExecutable(ctx context.Context, args LoadArgs) (loadedELF, *arch.Context64, *vfs.FileDescription, []string, error) {
+func loadExecutable(ctx context.Context, args LoadArgs) (loaded loadedELF, ac *arch.Context64, file *vfs.FileDescription, out LoadArgs, err error) {
+	out = args
+	defer func() {
+		if err != nil && out.ExecFD != nil {
+			out.ExecFD.DecRef(ctx)
+			out.ExecFD = nil
+		}
+	}()
 	for i := 0; i < maxLoaderAttempts; i++ {
-		if args.File == nil {
-			var err error
-			args.File, err = openPath(ctx, args)
+		if out.File == nil {
+			out.File, err = openPath(ctx, out)
 			if err != nil {
 				// ENOENT is common for runtimes that try to exec many locations on PATH (e.g Python).
 				// Don't log those errors to avoid spam.
 				if !errors.Is(err, linuxerr.ENOENT) {
-					ctx.Infof("Error opening %s: %v", args.Filename, err)
+					ctx.Infof("Error opening %s: %v", out.Filename, err)
 				}
-				return loadedELF{}, nil, nil, nil, err
+				return loadedELF{}, nil, nil, LoadArgs{}, err
 			}
 			// Ensure file is release in case the code loops or errors out.
-			defer args.File.DecRef(ctx)
+			defer out.File.DecRef(ctx)
 		} else {
-			if err := checkIsRegularFile(ctx, args.File, args.Filename); err != nil {
-				return loadedELF{}, nil, nil, nil, err
+			if err = checkIsRegularFile(ctx, out.File, out.Filename); err != nil {
+				return loadedELF{}, nil, nil, LoadArgs{}, err
 			}
 		}
 
-		// Check the header. Is this an ELF or interpreter script?
-		var hdr [4]uint8
+		var hdr [256]uint8
 		// N.B. We assume that reading from a regular file cannot block.
-		_, err := args.File.ReadFull(ctx, usermem.BytesIOSequence(hdr[:]), 0)
+		var n int64
+		n, err = out.File.ReadFull(ctx, usermem.BytesIOSequence(hdr[:]), 0)
 		// Allow unexpected EOF, as a valid executable could be only three bytes
 		// (e.g., #!a).
 		if err != nil && err != io.ErrUnexpectedEOF {
 			if err == io.EOF {
 				err = linuxerr.ENOEXEC
 			}
-			return loadedELF{}, nil, nil, nil, err
+			return loadedELF{}, nil, nil, LoadArgs{}, err
+		}
+		head := hdr[:n]
+
+		if BinfmtMiscHook != nil {
+			var match *BinfmtMiscMatch
+			match, err = BinfmtMiscHook(ctx, head, out.Filename, out.Argv, out.File)
+			if err != nil {
+				return loadedELF{}, nil, nil, LoadArgs{}, err
+			}
+			if match != nil {
+				if out.CloseOnExec {
+					return loadedELF{}, nil, nil, LoadArgs{}, linuxerr.ENOENT
+				}
+				if match.Synthesize != nil {
+					out.synthesize = match.Synthesize
+					out.File.IncRef()
+					return loadedELF{}, nil, out.File, out, nil
+				}
+				out.Filename = match.Interpreter
+				out.Argv = match.Argv
+				if match.ExecFD != nil {
+					if out.ExecFD != nil {
+						match.ExecFD.DecRef(ctx)
+						return loadedELF{}, nil, nil, LoadArgs{}, linuxerr.ENOEXEC
+					}
+					out.ExecFD = match.ExecFD
+				}
+				if match.CredsFromBinary {
+					out.CredsFromBinary = true
+				}
+				if match.InterpFile != nil {
+					defer match.InterpFile.DecRef(ctx)
+					out.File = match.InterpFile
+				} else {
+					out.File = nil
+				}
+				continue
+			}
 		}
 
 		switch {
-		case bytes.Equal(hdr[:], []byte(elfMagic)):
-			loaded, ac, err := loadELF(ctx, args)
+		case n >= int64(len(elfMagic)) && bytes.Equal(head[:len(elfMagic)], []byte(elfMagic)):
+			loaded, ac, err := loadELF(ctx, out)
 			if err != nil {
 				ctx.Infof("Error loading ELF: %v", err)
-				return loadedELF{}, nil, nil, nil, err
+				return loadedELF{}, nil, nil, LoadArgs{}, err
 			}
 			// An ELF is always terminal. Hold on to file.
-			args.File.IncRef()
-			return loaded, ac, args.File, args.Argv, err
+			out.File.IncRef()
+			return loaded, ac, out.File, out, err
 
-		case bytes.Equal(hdr[:2], []byte(interpreterScriptMagic)):
-			if args.CloseOnExec {
-				return loadedELF{}, nil, nil, nil, linuxerr.ENOENT
+		case n >= 2 && bytes.Equal(head[:2], []byte(interpreterScriptMagic)):
+			if out.CloseOnExec {
+				return loadedELF{}, nil, nil, LoadArgs{}, linuxerr.ENOENT
 			}
-			args.Filename, args.Argv, err = parseInterpreterScript(ctx, args.Filename, args.File, args.Argv)
+			out.Filename, out.Argv, err = parseInterpreterScript(ctx, out.Filename, out.File, out.Argv)
 			if err != nil {
 				ctx.Infof("Error loading interpreter script: %v", err)
-				return loadedELF{}, nil, nil, nil, err
+				return loadedELF{}, nil, nil, LoadArgs{}, err
 			}
 			// Refresh the traversal limit for the interpreter.
-			*args.RemainingTraversals = linux.MaxSymlinkTraversals
 
 		default:
-			ctx.Infof("Unknown magic for %s: %v", args.Filename, hdr)
-			return loadedELF{}, nil, nil, nil, linuxerr.ENOEXEC
+			ctx.Infof("Unknown magic for %s: %v", out.Filename, head)
+			return loadedELF{}, nil, nil, LoadArgs{}, linuxerr.ENOEXEC
 		}
 		// Set to nil in case we loop on a Interpreter Script.
-		args.File = nil
+		out.File = nil
 	}
 
-	return loadedELF{}, nil, nil, nil, linuxerr.ELOOP
+	return loadedELF{}, nil, nil, LoadArgs{}, linuxerr.ELOOP
 }
 
 // ImageInfo represents the information for the loaded image.
@@ -263,6 +330,9 @@ type ImageInfo struct {
 	Arch *arch.Context64
 	// The base name of the binary.
 	Name string
+
+	ExecFD *vfs.FileDescription
+	ExecFDValueAddr hostarch.Addr
 }
 
 // Load loads args.File into a MemoryManager. If args.File is nil, the path
@@ -278,11 +348,21 @@ type ImageInfo struct {
 //   - Load is called on the Task goroutine.
 func Load(ctx context.Context, args LoadArgs, extraAuxv []arch.AuxEntry, vdso *VDSO) (ImageInfo, *auth.Credentials, bool, *syserr.Error) {
 	// Load the executable itself.
-	loaded, ac, file, newArgv, err := loadExecutable(ctx, args)
+	loaded, ac, file, loadOut, err := loadExecutable(ctx, args)
 	if err != nil {
 		return ImageInfo{}, nil, false, syserr.NewDynamic(fmt.Sprintf("failed to load %s: %v", args.Filename, err), syserr.FromError(err).ToLinux())
 	}
 	defer file.DecRef(ctx)
+	if loadOut.synthesize != nil {
+		return loadOut.synthesize(ctx, loadOut, file)
+	}
+	newArgv := loadOut.Argv
+	execFD := loadOut.ExecFD
+	defer func() {
+		if execFD != nil {
+			execFD.DecRef(ctx)
+		}
+	}()
 	args.StartupTimeline.Reached("executable loaded")
 
 	// Load the VDSO.
@@ -330,11 +410,15 @@ func Load(ctx context.Context, args LoadArgs, extraAuxv []arch.AuxEntry, vdso *V
 	}
 	platform := stack.Bottom
 
-	filePrivs, err := file.GetFilePrivileges(ctx)
+	credsFile := file
+	if loadOut.CredsFromBinary && loadOut.ExecFD != nil {
+		credsFile = loadOut.ExecFD
+	}
+	filePrivs, err := credsFile.GetFilePrivileges(ctx)
 	if err != nil {
 		return ImageInfo{}, nil, false, syserr.NewDynamic(fmt.Sprintf("failed to read file privileges of %s: %v", args.Filename, err), syserr.FromError(err).ToLinux())
 	}
-	c, secureExec, err := auth.ComputeCredsForExec(auth.CredentialsFromContext(ctx), filePrivs, file.MappedName(ctx),
+	c, secureExec, err := auth.ComputeCredsForExec(auth.CredentialsFromContext(ctx), filePrivs, credsFile.MappedName(ctx),
 		args.NoNewPrivs, args.StopPrivGain, args.AllowSUID)
 	if err != nil {
 		return ImageInfo{}, nil, false, syserr.NewDynamic(fmt.Sprintf("failed to update creds with file privileges: %v", err), syserr.FromError(err).ToLinux())
@@ -361,6 +445,12 @@ func Load(ctx context.Context, args LoadArgs, extraAuxv []arch.AuxEntry, vdso *V
 		arch.AuxEntry{linux.AT_HWCAP2, hostarch.Addr(args.Features.AllowedHWCap2())},
 	}...)
 
+	execFDEntry := -1
+	if loadOut.ExecFD != nil {
+		auxv = append(auxv, arch.AuxEntry{linux.AT_EXECFD, 0})
+		execFDEntry = len(auxv) - 1
+	}
+
 	sl, err := stack.Load(newArgv, args.Envv, auxv)
 	if err != nil {
 		return ImageInfo{}, nil, false, syserr.NewDynamic(fmt.Sprintf("Failed to load stack: %v", err), syserr.FromError(err).ToLinux())
@@ -384,9 +474,15 @@ func Load(ctx context.Context, args LoadArgs, extraAuxv []arch.AuxEntry, vdso *V
 		name = name[:linux.TASK_COMM_LEN-1]
 	}
 
-	return ImageInfo{
+	info := ImageInfo{
 		OS:   loaded.os,
 		Arch: ac,
 		Name: name,
-	}, c, secureExec, nil
+	}
+	if execFDEntry >= 0 {
+		info.ExecFD = execFD
+		info.ExecFDValueAddr = sl.AuxvStart + hostarch.Addr(uint(execFDEntry)*2*ac.Width()+ac.Width())
+		execFD = nil // ownership transferred to info
+	}
+	return info, c, secureExec, nil
 }
