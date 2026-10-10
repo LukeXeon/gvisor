@@ -170,6 +170,9 @@ type Kernel struct {
 	// Kernel.
 	platform.Platform `state:"nosave"`
 
+	// Binary format registration is owned by the embedding runtime.
+	binaryFormats loader.BinaryFormatHandler `state:"nosave"`
+
 	// mf provides application memory.
 	mf *pgalloc.MemoryFile `state:"nosave"`
 

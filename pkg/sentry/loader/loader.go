@@ -63,6 +63,9 @@ type LoadArgs struct {
 	// The caller is responsible for checking that the user can execute this file.
 	File *vfs.FileDescription
 
+	// BinaryFormats handles formats registered outside the kernel package.
+	BinaryFormats BinaryFormatHandler
+
 	// Root is the current filesystem root.
 	Root vfs.VirtualDentry
 
@@ -101,6 +104,27 @@ type LoadArgs struct {
 	// StartupTimeline tracks this load as part of overall sandbox startup.
 	// Only set when loading the initial task image of the root container.
 	StartupTimeline *timing.Timeline
+}
+
+// BinaryFormatHandler participates in the normal executable traversal. The
+// handler returns nil for no match. If InterpreterFile is set, ownership of
+// that reference transfers to the loader; on error it remains with the handler.
+type BinaryFormatHandler interface {
+	Match(ctx context.Context, header []byte, filename string, argv []string, file *vfs.FileDescription) (*BinaryFormatMatch, error)
+}
+
+// BinaryFormatMatch describes one interpreter rewrite. Argv contains the
+// complete argument vector for the interpreter. OpenBinary requests AT_EXECFD
+// and CredentialsFromBinary selects the original executable's credentials.
+type BinaryFormatMatch struct {
+	Interpreter     string
+	InterpreterFile *vfs.FileDescription
+	Argv            []string
+	// EnvAdd contains key=value entries installed only for the interpreter.
+	// Each entry replaces a matching key in the original environment.
+	EnvAdd                []string
+	OpenBinary            bool
+	CredentialsFromBinary bool
 }
 
 // openPath opens args.Filename and checks that it is valid for loading.
@@ -181,16 +205,25 @@ const (
 // can execute this file is done here in this case). If the executable is an
 // interpreter script rather than an ELF, the binary of the corresponding
 // interpreter will be loaded.
-//
-// It returns:
-//   - loadedELF, description of the loaded binary
-//   - arch.Context64 matching the binary arch
-//   - fs.Dirent of the binary file
-//   - Possibly updated args.Argv
-func loadExecutable(ctx context.Context, args LoadArgs) (loadedELF, *arch.Context64, *vfs.FileDescription, []string, error) {
+type executableResult struct {
+	loaded          loadedELF
+	arch            *arch.Context64
+	file            *vfs.FileDescription
+	argv            []string
+	envv            []string
+	execFD          *vfs.FileDescription
+	credsFromBinary bool
+}
+
+func loadExecutable(ctx context.Context, args LoadArgs) (result executableResult, err error) {
+	defer func() {
+		if err != nil && result.execFD != nil {
+			result.execFD.DecRef(ctx)
+			result.execFD = nil
+		}
+	}()
 	for i := 0; i < maxLoaderAttempts; i++ {
 		if args.File == nil {
-			var err error
 			args.File, err = openPath(ctx, args)
 			if err != nil {
 				// ENOENT is common for runtimes that try to exec many locations on PATH (e.g Python).
@@ -198,61 +231,117 @@ func loadExecutable(ctx context.Context, args LoadArgs) (loadedELF, *arch.Contex
 				if !errors.Is(err, linuxerr.ENOENT) {
 					ctx.Infof("Error opening %s: %v", args.Filename, err)
 				}
-				return loadedELF{}, nil, nil, nil, err
+				return result, err
 			}
 			// Ensure file is release in case the code loops or errors out.
 			defer args.File.DecRef(ctx)
 		} else {
 			if err := checkIsRegularFile(ctx, args.File, args.Filename); err != nil {
-				return loadedELF{}, nil, nil, nil, err
+				return result, err
 			}
 		}
 
 		// Check the header. Is this an ELF or interpreter script?
-		var hdr [4]uint8
+		var hdr [256]uint8
 		// N.B. We assume that reading from a regular file cannot block.
-		_, err := args.File.ReadFull(ctx, usermem.BytesIOSequence(hdr[:]), 0)
+		n, readErr := args.File.ReadFull(ctx, usermem.BytesIOSequence(hdr[:]), 0)
 		// Allow unexpected EOF, as a valid executable could be only three bytes
 		// (e.g., #!a).
-		if err != nil && err != io.ErrUnexpectedEOF {
-			if err == io.EOF {
-				err = linuxerr.ENOEXEC
+		if readErr != nil && readErr != io.ErrUnexpectedEOF {
+			if readErr == io.EOF {
+				readErr = linuxerr.ENOEXEC
 			}
-			return loadedELF{}, nil, nil, nil, err
+			return result, readErr
+		}
+
+		if args.BinaryFormats != nil {
+			match, matchErr := args.BinaryFormats.Match(ctx, hdr[:], args.Filename, args.Argv, args.File)
+			if matchErr != nil {
+				return result, matchErr
+			}
+			if match != nil {
+				if match.Interpreter == "" || (match.CredentialsFromBinary && !match.OpenBinary) {
+					if match.InterpreterFile != nil {
+						match.InterpreterFile.DecRef(ctx)
+					}
+					return result, linuxerr.EINVAL
+				}
+				if args.CloseOnExec {
+					if match.InterpreterFile != nil {
+						match.InterpreterFile.DecRef(ctx)
+					}
+					return result, linuxerr.ENOENT
+				}
+				if match.OpenBinary {
+					if result.execFD != nil {
+						if match.InterpreterFile != nil {
+							match.InterpreterFile.DecRef(ctx)
+						}
+						return result, linuxerr.ENOEXEC
+					}
+					args.File.IncRef()
+					result.execFD = args.File
+					result.credsFromBinary = match.CredentialsFromBinary
+				}
+				args.Filename = match.Interpreter
+				args.Argv = match.Argv
+				if len(match.EnvAdd) != 0 {
+					args.Envv, err = addInterpreterEnv(args.Envv, match.EnvAdd)
+					if err != nil {
+						if match.InterpreterFile != nil {
+							match.InterpreterFile.DecRef(ctx)
+						}
+						return result, err
+					}
+				}
+				if match.InterpreterFile != nil {
+					file := match.InterpreterFile
+					defer file.DecRef(ctx)
+					args.File = file
+				} else {
+					args.File = nil
+				}
+				continue
+			}
 		}
 
 		switch {
-		case bytes.Equal(hdr[:], []byte(elfMagic)):
+		case n >= int64(len(elfMagic)) && bytes.Equal(hdr[:len(elfMagic)], []byte(elfMagic)):
 			loaded, ac, err := loadELF(ctx, args)
 			if err != nil {
 				ctx.Infof("Error loading ELF: %v", err)
-				return loadedELF{}, nil, nil, nil, err
+				return result, err
 			}
 			// An ELF is always terminal. Hold on to file.
 			args.File.IncRef()
-			return loaded, ac, args.File, args.Argv, err
+			result.loaded = loaded
+			result.arch = ac
+			result.file = args.File
+			result.argv = args.Argv
+			result.envv = args.Envv
+			return result, nil
 
-		case bytes.Equal(hdr[:2], []byte(interpreterScriptMagic)):
+		case n >= 2 && bytes.Equal(hdr[:2], []byte(interpreterScriptMagic)):
 			if args.CloseOnExec {
-				return loadedELF{}, nil, nil, nil, linuxerr.ENOENT
+				return result, linuxerr.ENOENT
 			}
 			args.Filename, args.Argv, err = parseInterpreterScript(ctx, args.Filename, args.File, args.Argv)
 			if err != nil {
 				ctx.Infof("Error loading interpreter script: %v", err)
-				return loadedELF{}, nil, nil, nil, err
+				return result, err
 			}
 			// Refresh the traversal limit for the interpreter.
 			*args.RemainingTraversals = linux.MaxSymlinkTraversals
 
 		default:
 			ctx.Infof("Unknown magic for %s: %v", args.Filename, hdr)
-			return loadedELF{}, nil, nil, nil, linuxerr.ENOEXEC
+			return result, linuxerr.ENOEXEC
 		}
 		// Set to nil in case we loop on a Interpreter Script.
 		args.File = nil
 	}
 
-	return loadedELF{}, nil, nil, nil, linuxerr.ELOOP
+	return result, linuxerr.ELOOP
 }
 
 // ImageInfo represents the information for the loaded image.
@@ -263,6 +352,10 @@ type ImageInfo struct {
 	Arch *arch.Context64
 	// The base name of the binary.
 	Name string
+	// ExecFD is installed in the task FD table when exec commits.
+	ExecFD *vfs.FileDescription
+	// ExecFDValueAddr points at the AT_EXECFD value on the new user stack.
+	ExecFDValueAddr hostarch.Addr
 }
 
 // Load loads args.File into a MemoryManager. If args.File is nil, the path
@@ -278,11 +371,17 @@ type ImageInfo struct {
 //   - Load is called on the Task goroutine.
 func Load(ctx context.Context, args LoadArgs, extraAuxv []arch.AuxEntry, vdso *VDSO) (ImageInfo, *auth.Credentials, bool, *syserr.Error) {
 	// Load the executable itself.
-	loaded, ac, file, newArgv, err := loadExecutable(ctx, args)
+	executable, err := loadExecutable(ctx, args)
 	if err != nil {
 		return ImageInfo{}, nil, false, syserr.NewDynamic(fmt.Sprintf("failed to load %s: %v", args.Filename, err), syserr.FromError(err).ToLinux())
 	}
+	loaded, ac, file, newArgv := executable.loaded, executable.arch, executable.file, executable.argv
 	defer file.DecRef(ctx)
+	defer func() {
+		if executable.execFD != nil {
+			executable.execFD.DecRef(ctx)
+		}
+	}()
 	args.StartupTimeline.Reached("executable loaded")
 
 	// Load the VDSO.
@@ -330,11 +429,15 @@ func Load(ctx context.Context, args LoadArgs, extraAuxv []arch.AuxEntry, vdso *V
 	}
 	platform := stack.Bottom
 
-	filePrivs, err := file.GetFilePrivileges(ctx)
+	credsFile := file
+	if executable.credsFromBinary {
+		credsFile = executable.execFD
+	}
+	filePrivs, err := credsFile.GetFilePrivileges(ctx)
 	if err != nil {
 		return ImageInfo{}, nil, false, syserr.NewDynamic(fmt.Sprintf("failed to read file privileges of %s: %v", args.Filename, err), syserr.FromError(err).ToLinux())
 	}
-	c, secureExec, err := auth.ComputeCredsForExec(auth.CredentialsFromContext(ctx), filePrivs, file.MappedName(ctx),
+	c, secureExec, err := auth.ComputeCredsForExec(auth.CredentialsFromContext(ctx), filePrivs, credsFile.MappedName(ctx),
 		args.NoNewPrivs, args.StopPrivGain, args.AllowSUID)
 	if err != nil {
 		return ImageInfo{}, nil, false, syserr.NewDynamic(fmt.Sprintf("failed to update creds with file privileges: %v", err), syserr.FromError(err).ToLinux())
@@ -360,8 +463,11 @@ func Load(ctx context.Context, args LoadArgs, extraAuxv []arch.AuxEntry, vdso *V
 		arch.AuxEntry{linux.AT_HWCAP, hostarch.Addr(args.Features.AllowedHWCap1())},
 		arch.AuxEntry{linux.AT_HWCAP2, hostarch.Addr(args.Features.AllowedHWCap2())},
 	}...)
+	if executable.execFD != nil {
+		auxv = append(auxv, arch.AuxEntry{Key: linux.AT_EXECFD})
+	}
 
-	sl, err := stack.Load(newArgv, args.Envv, auxv)
+	sl, err := stack.Load(newArgv, executable.envv, auxv)
 	if err != nil {
 		return ImageInfo{}, nil, false, syserr.NewDynamic(fmt.Sprintf("Failed to load stack: %v", err), syserr.FromError(err).ToLinux())
 	}
@@ -384,9 +490,15 @@ func Load(ctx context.Context, args LoadArgs, extraAuxv []arch.AuxEntry, vdso *V
 		name = name[:linux.TASK_COMM_LEN-1]
 	}
 
-	return ImageInfo{
+	info := ImageInfo{
 		OS:   loaded.os,
 		Arch: ac,
 		Name: name,
-	}, c, secureExec, nil
+	}
+	if executable.execFD != nil {
+		info.ExecFD = executable.execFD
+		info.ExecFDValueAddr = sl.AuxvStart + hostarch.Addr(uint(len(auxv)-1)*2*ac.Width()+ac.Width())
+		executable.execFD = nil
+	}
+	return info, c, secureExec, nil
 }

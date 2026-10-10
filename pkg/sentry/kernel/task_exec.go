@@ -65,9 +65,12 @@ package kernel
 // """
 
 import (
+	"encoding/binary"
+
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/overlay"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/tmpfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
@@ -77,6 +80,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/syserr"
+	"gvisor.dev/gvisor/pkg/usermem"
 
 	pb "gvisor.dev/gvisor/pkg/sentry/seccheck/points/points_go_proto"
 )
@@ -346,13 +350,40 @@ func (r *runExecveAfterSiblingExitStop) execute(t *Task) taskRunState {
 	t.tg.pidns.owner.mu.Unlock()
 
 	oldFDTable := t.fdTable
-	t.fdTable = t.fdTable.Fork(t, int32(t.fdTable.CurrentMaxFDs()))
-	oldFDTable.DecRef(t)
+	newFDTable := oldFDTable.Fork(t, int32(oldFDTable.CurrentMaxFDs()))
 
 	// Remove FDs with the CloseOnExec flag set.
-	t.fdTable.RemoveIf(t, func(_ *vfs.FileDescription, flags FDFlags) bool {
+	newFDTable.RemoveIf(t, func(_ *vfs.FileDescription, flags FDFlags) bool {
 		return flags.CloseOnExec
 	})
+	if r.image.execFD != nil {
+		fd, err := newFDTable.NewFD(t, 0, r.image.execFD, FDFlags{})
+		if err != nil {
+			newFDTable.DecRef(t)
+			r.image.release(t)
+			return t.doSyscallError(err)
+		}
+		var value [8]byte
+		binary.LittleEndian.PutUint64(value[:], uint64(fd))
+		m := r.image.MemoryManager
+		if _, err := m.CopyOut(t, r.image.execFDValueAddr, value[:], usermem.IOOpts{}); err != nil {
+			newFDTable.DecRef(t)
+			r.image.release(t)
+			return t.doSyscallError(err)
+		}
+		auxv := m.Auxv()
+		for i := range auxv {
+			if auxv[i].Key == linux.AT_EXECFD {
+				auxv[i].Value = hostarch.Addr(fd)
+				break
+			}
+		}
+		m.SetAuxv(auxv)
+		r.image.execFD.DecRef(t)
+		r.image.execFD = nil
+	}
+	t.fdTable = newFDTable
+	oldFDTable.DecRef(t)
 
 	// Handle the robust futex list.
 	t.exitRobustList()
