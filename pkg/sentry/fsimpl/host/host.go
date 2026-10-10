@@ -28,6 +28,7 @@ import (
 	"gvisor.dev/gvisor/pkg/fdnotifier"
 	"gvisor.dev/gvisor/pkg/fspath"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/hostcompat"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/checkpoint"
@@ -490,7 +491,7 @@ func (i *inode) Stat(ctx context.Context, vfsfs *vfs.Filesystem, opts vfs.StatOp
 	// Limit our host call only to known flags.
 	mask := opts.Mask & linux.STATX_ALL
 	var s unix.Statx_t
-	err := unix.Statx(i.hostFD, "", int(unix.AT_EMPTY_PATH|opts.Sync), int(mask), &s)
+	err := hostcompat.Statx(i.hostFD, "", int(unix.AT_EMPTY_PATH|opts.Sync), int(mask), &s)
 	if linuxerr.Equals(linuxerr.ENOSYS, err) {
 		// Fallback to fstat(2), if statx(2) is not supported on the host.
 		//
