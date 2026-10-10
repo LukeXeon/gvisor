@@ -55,6 +55,7 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/hostcompat"
 	"gvisor.dev/gvisor/pkg/lisafs"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/refs"
@@ -1294,7 +1295,7 @@ func (d *dentry) refreshSizeLocked(ctx context.Context) error {
 	// Using statx(2) with a minimal mask is faster than fstat(2).
 	var stat unix.Statx_t
 	// Can use RacyLoad() because handleMu is locked.
-	err := unix.Statx(int(d.inode.writeFD.RacyLoad()), "", unix.AT_EMPTY_PATH, unix.STATX_SIZE, &stat)
+	err := hostcompat.Statx(int(d.inode.writeFD.RacyLoad()), "", unix.AT_EMPTY_PATH, unix.STATX_SIZE, &stat)
 	d.inode.handleMu.RUnlock() // must be released before updateSizeLocked()
 	if err != nil {
 		return err

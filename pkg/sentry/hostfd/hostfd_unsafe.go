@@ -18,6 +18,7 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/hostcompat"
 )
 
 const (
@@ -38,7 +39,7 @@ func iovecsReadWrite(sysno uintptr, fd int32, iovs []unix.Iovec, offset int64, f
 		if offset >= 0 {
 			curOff = offset + int64(total)
 		}
-		cur, _, e := unix.Syscall6(sysno, uintptr(fd), uintptr((unsafe.Pointer)(&iovs[start])), uintptr(size), uintptr(curOff), 0 /* pos_h */, uintptr(flags))
+		cur, _, e := hostcompat.Syscall6(sysno, uintptr(fd), uintptr((unsafe.Pointer)(&iovs[start])), uintptr(size), uintptr(curOff), 0 /* pos_h */, uintptr(flags))
 		if e != 0 {
 			return total, e
 		}
