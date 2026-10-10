@@ -349,6 +349,11 @@ func (fd *specialFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 	d.inode.mappings.Invalidate(mr, memmap.InvalidateOpts{})
 	d.inode.mapsMu.Unlock()
 
+	if fd.isRegularFile && src.NumBytes() > 0 {
+		if err := d.inode.dropHostCapability(); err != nil {
+			return 0, offset, err
+		}
+	}
 	rw := getHandleReadWriter(ctx, &fd.handle, offset)
 	n, err := src.CopyInTo(ctx, rw)
 	putHandleReadWriter(rw)
@@ -421,6 +426,9 @@ func (fd *specialFileFD) sync(ctx context.Context, forFilesystemSync bool, dataO
 	fd.releaseMu.RLock()
 	defer fd.releaseMu.RUnlock()
 
+	if file := fd.dentry().inode.backendFile(); file != nil && fd.isRegularFile {
+		return file.Sync(int(fd.handle.fd), dataOnly)
+	}
 	var err error
 	if dataOnly {
 		err = fd.handle.syncData(ctx)

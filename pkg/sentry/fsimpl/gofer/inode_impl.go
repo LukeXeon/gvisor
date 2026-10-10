@@ -233,16 +233,43 @@ func (d *dentry) chmod(ctx context.Context, mode uint16) error {
 //   - !d.isSynthetic().
 //   - i.handleMu is locked.
 //   - fs.renameMu is locked.
-func (d *dentry) setStatLocked(ctx context.Context, stat *linux.Statx) (uint32, error, error) {
+func (d *dentry) setStatLocked(ctx context.Context, stat *linux.Statx, clearPrivs bool) (uint32, error, error) {
 	switch it := d.inode.impl.(type) {
 	case *lisafsInode:
 		return it.controlFD.SetStat(ctx, stat)
 	case *directfsInode:
-		failureMask, failureErr := it.setStatLocked(ctx, stat, d)
+		failureMask, failureErr := it.setStatLocked(ctx, stat, clearPrivs, d)
 		return failureMask, failureErr, nil
 	default:
 		panic("unknown inode implementation")
 	}
+}
+
+func (i *inode) backendFile() BackendFile {
+	if impl, ok := i.impl.(*directfsInode); ok {
+		return impl.backendFile
+	}
+	return nil
+}
+
+// +checklocks:d.inode.metadataMu
+func (d *dentry) refreshHostMetadataLocked(ctx context.Context) error {
+	if d.inode.backendFile() != nil && !d.inode.cachedMetadataAuthoritative() {
+		return d.inode.updateMetadataLocked(ctx, noHandle)
+	}
+	return nil
+}
+
+// dropHostCapability clears the shared inode attribute through its backend.
+// The caller holds metadataMu when updating a regular file.
+func (i *inode) dropHostCapability() error {
+	if file := i.backendFile(); file != nil {
+		if err := file.DropCapability(); err != nil {
+			return err
+		}
+		i.xattrCache.addNegative(linux.XATTR_SECURITY_CAPABILITY)
+	}
+	return nil
 }
 
 // Precondition: i.handleMu must be locked.
@@ -437,6 +464,10 @@ func (i *inode) flush(ctx context.Context) error {
 
 // Precondition: !d.isSynthetic().
 func (i *inode) allocate(ctx context.Context, mode, offset, length uint64) error {
+	if err := i.dropHostCapability(); err != nil {
+		return err
+	}
+
 	i.handleMu.RLock()
 	defer i.handleMu.RUnlock()
 	switch it := i.impl.(type) {
@@ -488,6 +519,9 @@ func (i *inode) unlink(ctx context.Context, name string, flags uint32) error {
 	case *lisafsInode:
 		return it.controlFD.UnlinkAt(ctx, name, flags)
 	case *directfsInode:
+		if it.backendFile != nil {
+			return it.backendFile.Unlink(name, flags)
+		}
 		return unix.Unlinkat(it.controlFD, name, int(flags))
 	default:
 		panic("unknown inode implementation")
@@ -500,6 +534,9 @@ func (i *inode) rename(ctx context.Context, oldName string, newParent *dentry, n
 	case *lisafsInode:
 		return it.controlFD.RenameAt(ctx, oldName, newParent.inode.impl.(*lisafsInode).controlFD.ID(), newName, flags)
 	case *directfsInode:
+		if it.backendFile != nil {
+			return it.backendFile.Rename(oldName, newParent.inode.impl.(*directfsInode).backendFile, newName, flags)
+		}
 		return fsutil.RenameAt2(it.controlFD, oldName, newParent.inode.impl.(*directfsInode).controlFD, newName, flags)
 	default:
 		panic("unknown inode implementation")

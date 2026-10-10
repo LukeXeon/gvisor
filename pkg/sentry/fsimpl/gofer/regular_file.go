@@ -222,6 +222,12 @@ func (fd *regularFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 	}
 	src = src.TakeFirst64(limit)
 
+	if src.NumBytes() > 0 {
+		if err := d.inode.dropHostCapability(); err != nil {
+			return 0, offset, err
+		}
+	}
+
 	if d.inode.fs.opts.interop != InteropModeShared {
 		// Compare Linux's mm/filemap.c:__generic_file_write_iter() =>
 		// file_update_time(). This is d.touchCMtime(), but without locking

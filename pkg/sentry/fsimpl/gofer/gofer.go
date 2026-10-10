@@ -447,6 +447,11 @@ const (
 //
 // +stateify savable
 type InternalFilesystemOptions struct {
+	// FileBackend optionally provides directfs file operations. The mount's
+	// original readonly policy is independent of temporary VFS setup writes.
+	FileBackend FileBackend `state:"nosave"`
+	HostReadonly   bool           `state:"nosave"`
+
 	// If UniqueID is non-empty, it is used to reassociate the filesystem with
 	// a new server FD during restoration from checkpoint.
 	UniqueID checkpoint.ResourceID
@@ -632,6 +637,9 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		return nil, nil, linuxerr.EINVAL
 	}
 	// If !ok, iopts being the zero value is correct.
+	if iopts.FileBackend != nil && !fsopts.directfs.enabled {
+		return nil, nil, linuxerr.EINVAL
+	}
 
 	// Construct the filesystem object.
 	devMinor, err := vfsObj.GetAnonBlockDevMinor()
@@ -1321,7 +1329,9 @@ func (d *dentry) statTo(stat *linux.Statx) {
 	stat.Mask = linux.STATX_TYPE | linux.STATX_MODE | linux.STATX_NLINK | linux.STATX_UID | linux.STATX_GID | linux.STATX_ATIME | linux.STATX_MTIME | linux.STATX_CTIME | linux.STATX_INO | linux.STATX_SIZE | linux.STATX_BLOCKS
 	stat.Blksize = d.inode.blockSize.Load()
 	stat.Nlink = d.inode.nlink.Load()
-	if stat.Nlink == 0 {
+	// FileBackend supplies a real link count, including zero for a live FD
+	// or mapping after the last name is removed.
+	if stat.Nlink == 0 && d.inode.backendFile() == nil {
 		// The remote filesystem doesn't support link count; just make
 		// something up. This is consistent with Linux, where
 		// fs/inode.c:inode_init_always() initializes link count to 1, and
@@ -1358,6 +1368,11 @@ func (d *dentry) setStat(ctx context.Context, creds *auth.Credentials, opts *vfs
 	}
 	if stat.Mask&^(linux.STATX_MODE|linux.STATX_UID|linux.STATX_GID|linux.STATX_ATIME|linux.STATX_MTIME|linux.STATX_SIZE) != 0 {
 		return linuxerr.EPERM
+	}
+	if d.inode.backendFile() != nil && !d.inode.cachedMetadataAuthoritative() {
+		if err := d.inode.updateMetadata(ctx); err != nil {
+			return err
+		}
 	}
 	mode := linux.FileMode(d.inode.mode.Load())
 	if err := vfs.CheckSetStat(ctx, creds, opts, mode, nil, auth.KUID(d.inode.uid.Load()), auth.KGID(d.inode.gid.Load())); err != nil {
@@ -1444,7 +1459,7 @@ func (d *dentry) setStat(ctx context.Context, creds *auth.Credentials, opts *vfs
 	var failureMask uint32
 	var failureErr error
 	if !d.inode.isSynthetic() {
-		if stat.Mask != 0 {
+		if stat.Mask != 0 || (opts.ClearPrivs && d.inode.backendFile() != nil) {
 			if err := d.prepareSetStat(ctx, stat); err != nil {
 				return err
 			}
@@ -1457,7 +1472,7 @@ func (d *dentry) setStat(ctx context.Context, creds *auth.Credentials, opts *vfs
 				d.inode.dataMu.Lock()
 			}
 			var err error
-			failureMask, failureErr, err = d.setStatLocked(ctx, stat)
+			failureMask, failureErr, err = d.setStatLocked(ctx, stat, opts.ClearPrivs)
 			d.inode.handleMu.RUnlock()
 			if err != nil {
 				if stat.Mask&linux.STATX_SIZE != 0 {
@@ -1477,6 +1492,9 @@ func (d *dentry) setStat(ctx context.Context, creds *auth.Credentials, opts *vfs
 			}
 		}
 		if d.inode.fs.opts.interop == InteropModeShared {
+			if d.inode.backendFile() != nil && failureErr != nil {
+				return failureErr
+			}
 			// There's no point to updating d's metadata in this case since
 			// it'll be overwritten by revalidation before the next time it's
 			// used anyway. (InteropModeShared inhibits client caching of
@@ -1507,7 +1525,7 @@ func (d *dentry) setStat(ctx context.Context, creds *auth.Credentials, opts *vfs
 		d.inode.mtimeDirty.Store(0)
 	}
 	d.inode.ctime.Store(now)
-	if failureMask != 0 {
+	if failureMask != 0 || (d.inode.backendFile() != nil && failureErr != nil) {
 		// Setting some attribute failed on the remote filesystem.
 		return failureErr
 	}
@@ -1594,11 +1612,11 @@ func (d *dentry) checkXattrPermissions(creds *auth.Credentials, name string, ats
 	// Disallow the "trusted" namespace because neither the gofer nor the sentry
 	// processes have the capability to set these. It requires CAP_SYS_ADMIN in
 	// the host's root user namespace.
-	if strings.HasPrefix(name, linux.XATTR_TRUSTED_PREFIX) {
+	if d.inode.backendFile() == nil && strings.HasPrefix(name, linux.XATTR_TRUSTED_PREFIX) {
 		return linuxerr.EOPNOTSUPP
 	}
 	// Do not allow writes to the "security" namespace on the host filesystem.
-	if ats.MayWrite() && strings.HasPrefix(name, linux.XATTR_SECURITY_PREFIX) {
+	if d.inode.backendFile() == nil && ats.MayWrite() && strings.HasPrefix(name, linux.XATTR_SECURITY_PREFIX) {
 		return linuxerr.EOPNOTSUPP
 	}
 	// Allow all other extended attributes to be passed through to remote.
@@ -2064,7 +2082,7 @@ func (d *dentry) listXattr(ctx context.Context, size uint64) ([]string, error) {
 	defer d.inode.metadataMu.Unlock()
 	if d.inode.cachedMetadataAuthoritative() {
 		if names, cached := d.inode.xattrCache.getList(); cached {
-			return names, nil
+			return d.visibleHostXattrs(ctx, names, size)
 		}
 	}
 	names, err := d.listXattrImpl(ctx, size)
@@ -2074,7 +2092,44 @@ func (d *dentry) listXattr(ctx context.Context, size uint64) ([]string, error) {
 	if d.inode.cachedMetadataAuthoritative() {
 		d.inode.xattrCache.setList(names)
 	}
-	return names, nil
+	return d.visibleHostXattrs(ctx, names, size)
+}
+
+func (d *dentry) visibleHostXattrs(ctx context.Context, names []string, size uint64) ([]string, error) {
+	file := d.inode.backendFile()
+	if file == nil {
+		return names, nil
+	}
+	kept := make([]string, 0, len(names))
+	var length uint64
+	for _, name := range names {
+		if strings.HasPrefix(name, linux.XATTR_TRUSTED_PREFIX) && !auth.CredentialsFromContext(ctx).HasRootCapability(linux.CAP_SYS_ADMIN) {
+			continue
+		}
+		kept = append(kept, name)
+		length += uint64(len(name) + 1)
+	}
+	if size != 0 && length > size {
+		return nil, linuxerr.ERANGE
+	}
+	return kept, nil
+}
+
+func (d *dentry) fixupHostXattr(creds *auth.Credentials, opts *vfs.GetXattrOptions, value string) (string, error) {
+	if d.inode.backendFile() == nil {
+		return value, nil
+	}
+	if opts.Name == linux.XATTR_SECURITY_CAPABILITY {
+		var err error
+		value, err = auth.FixupVfsCapDataOnGet(creds, value)
+		if err != nil {
+			return "", err
+		}
+	}
+	if opts.Size != 0 && uint64(len(value)) > opts.Size {
+		return "", linuxerr.ERANGE
+	}
+	return value, nil
 }
 
 func (d *dentry) getXattr(ctx context.Context, creds *auth.Credentials, opts *vfs.GetXattrOptions) (string, error) {
@@ -2083,28 +2138,32 @@ func (d *dentry) getXattr(ctx context.Context, creds *auth.Credentials, opts *vf
 	}
 	d.inode.metadataMu.Lock()
 	defer d.inode.metadataMu.Unlock()
+	if err := d.refreshHostMetadataLocked(ctx); err != nil {
+		return "", err
+	}
 	if err := d.checkXattrPermissions(creds, opts.Name, vfs.MayRead); err != nil {
 		return "", err
 	}
-	if d.inode.cachedMetadataAuthoritative() {
+	cache := d.inode.cachedMetadataAuthoritative() && !(d.inode.backendFile() != nil && opts.Name == linux.XATTR_SECURITY_CAPABILITY)
+	if cache {
 		if val, negative, ok := d.inode.xattrCache.get(opts.Name); ok {
 			if negative {
 				return "", linuxerr.ENODATA
 			}
-			return val, nil
+			return d.fixupHostXattr(creds, opts, val)
 		}
 	}
 	val, err := d.getXattrImpl(ctx, opts)
 	if err != nil {
-		if d.inode.cachedMetadataAuthoritative() && linuxerr.Equals(linuxerr.ENODATA, err) {
+		if cache && linuxerr.Equals(linuxerr.ENODATA, err) {
 			d.inode.xattrCache.addNegative(opts.Name)
 		}
 		return "", err
 	}
-	if d.inode.cachedMetadataAuthoritative() {
+	if cache {
 		d.inode.xattrCache.add(opts.Name, val)
 	}
-	return val, nil
+	return d.fixupHostXattr(creds, opts, val)
 }
 
 func (d *dentry) setXattr(ctx context.Context, creds *auth.Credentials, opts *vfs.SetXattrOptions) error {
@@ -2113,8 +2172,20 @@ func (d *dentry) setXattr(ctx context.Context, creds *auth.Credentials, opts *vf
 	}
 	d.inode.metadataMu.Lock()
 	defer d.inode.metadataMu.Unlock()
+	if err := d.refreshHostMetadataLocked(ctx); err != nil {
+		return err
+	}
 	if err := d.checkXattrPermissions(creds, opts.Name, vfs.MayWrite); err != nil {
 		return err
+	}
+	if d.inode.backendFile() != nil && opts.Name == linux.XATTR_SECURITY_CAPABILITY {
+		copy := *opts
+		var err error
+		copy.Value, err = auth.FixupVfsCapDataOnSet(creds, opts.Value, auth.KUID(d.inode.uid.RacyLoad()), auth.KGID(d.inode.gid.RacyLoad()))
+		if err != nil {
+			return err
+		}
+		opts = &copy
 	}
 	if err := d.setXattrImpl(ctx, opts); err != nil {
 		return err
@@ -2131,6 +2202,9 @@ func (d *dentry) removeXattr(ctx context.Context, creds *auth.Credentials, name 
 	}
 	d.inode.metadataMu.Lock()
 	defer d.inode.metadataMu.Unlock()
+	if err := d.refreshHostMetadataLocked(ctx); err != nil {
+		return err
+	}
 	if err := d.checkXattrPermissions(creds, name, vfs.MayWrite); err != nil {
 		return err
 	}
@@ -2308,6 +2382,14 @@ func (d *dentry) syncRemoteFile(ctx context.Context, dataOnly bool) error {
 
 // Preconditions: d.inode.handleMu must be locked.
 func (d *dentry) syncRemoteFileLocked(ctx context.Context, dataOnly bool) error {
+	if file := d.inode.backendFile(); file != nil {
+		nativeFD := int(d.inode.writeHandle().fd)
+		if nativeFD < 0 {
+			nativeFD = int(d.inode.readHandle().fd)
+		}
+		return file.Sync(nativeFD, dataOnly)
+	}
+
 	// Prefer syncing write handles over read handles, since some remote
 	// filesystem implementations may not sync changes made through write
 	// handles otherwise.
@@ -2394,7 +2476,10 @@ func (fd *fileDescription) dentry() *dentry {
 // Stat implements vfs.FileDescriptionImpl.Stat.
 func (fd *fileDescription) Stat(ctx context.Context, opts vfs.StatOptions) (linux.Statx, error) {
 	d := fd.dentry()
-	const validMask = uint32(linux.STATX_MODE | linux.STATX_UID | linux.STATX_GID | linux.STATX_ATIME | linux.STATX_MTIME | linux.STATX_CTIME | linux.STATX_SIZE | linux.STATX_BLOCKS | linux.STATX_BTIME)
+	validMask := uint32(linux.STATX_MODE | linux.STATX_UID | linux.STATX_GID | linux.STATX_ATIME | linux.STATX_MTIME | linux.STATX_CTIME | linux.STATX_SIZE | linux.STATX_BLOCKS | linux.STATX_BTIME)
+	if d.inode.backendFile() != nil {
+		validMask |= linux.STATX_NLINK
+	}
 	if !d.inode.cachedMetadataAuthoritative() && opts.Mask&validMask != 0 && opts.Sync != linux.AT_STATX_DONT_SYNC {
 		// Use specialFileFD.handle.fileLisa for the Stat if available, for the
 		// same reason that we try to use open FD in updateMetadataLocked().
