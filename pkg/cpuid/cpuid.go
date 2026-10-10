@@ -219,9 +219,9 @@ type hwCap struct {
 //	0000460                    0                    0
 func readHWCap(auxvFilepath string) (hwCap, error) {
 	c := hwCap{}
-	if runtime.GOOS != "linux" {
+	if runtime.GOOS != "linux" && runtime.GOOS != "android" {
 		// Don't try to read Linux-specific /proc files.
-		return c, fmt.Errorf("readHwCap only supported on linux, not %s", runtime.GOOS)
+		return c, fmt.Errorf("readHwCap only supported on linux/android, not %s", runtime.GOOS)
 	}
 
 	auxv, err := os.ReadFile(auxvFilepath)
