@@ -17,6 +17,7 @@ package mm
 import (
 	"bytes"
 	"fmt"
+	"runtime"
 
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/hostarch"
@@ -89,14 +90,17 @@ func (mm *MemoryManager) ReadMapsDataInto(ctx context.Context, fn MapsCallbackFu
 		mm.appendVMAMapsEntryLocked(ctx, vseg, fn)
 	}
 
-	// We always emulate vsyscall, so advertise it here. Everything about a
-	// vsyscall region is static, so just hard code the maps entry since we
-	// don't have a real vma backing it. The vsyscall region is at the end of
+	// We always emulate vsyscall on amd64, so advertise it there. Everything
+	// about a vsyscall region is static, so just hard code the maps entry since
+	// we don't have a real vma backing it. The vsyscall region is at the end of
 	// the virtual address space so nothing should be mapped after it (if
 	// something is really mapped in the tiny ~10 MiB segment afterwards, we'll
 	// get the sorting on the maps file wrong at worst; but that's not possible
-	// on any current platform).
-	fn(hostarch.Addr(0xffffffffff600000), hostarch.Addr(0xffffffffff601000), hostarch.ReadExecute, "p", 0, 0, 0, 0, "[vsyscall]")
+	// on any current platform). arm64 has no vsyscall page, and programs that
+	// probe the address space through maps would misread the entry.
+	if runtime.GOARCH == "amd64" {
+		fn(hostarch.Addr(0xffffffffff600000), hostarch.Addr(0xffffffffff601000), hostarch.ReadExecute, "p", 0, 0, 0, 0, "[vsyscall]")
+	}
 }
 
 // vmaMapsEntryLocked returns a /proc/[pid]/maps entry for the vma iterated by
@@ -148,9 +152,11 @@ func (mm *MemoryManager) ReadSmapsDataInto(ctx context.Context, buf *bytes.Buffe
 		mm.vmaSmapsEntryIntoLocked(ctx, vseg, buf)
 	}
 
-	// We always emulate vsyscall, so advertise it here. See
-	// ReadMapsSeqFileData for additional commentary.
-	buf.WriteString(vsyscallSmapsEntry)
+	// We always emulate vsyscall on amd64, so advertise it there. See
+	// ReadMapsDataInto for why arm64 omits it.
+	if runtime.GOARCH == "amd64" {
+		buf.WriteString(vsyscallSmapsEntry)
+	}
 }
 
 // vmaSmapsEntryLocked returns a /proc/[pid]/smaps entry for the vma iterated
