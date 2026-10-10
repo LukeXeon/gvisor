@@ -54,7 +54,7 @@ func (fs FeatureSet) Intersect(allowedFeatures map[Feature]struct{}) (FeatureSet
 // Must run before syscall filter installation. This value is used to create
 // the fake /proc/cpuinfo from a FeatureSet.
 func initCPUInfo() {
-	if runtime.GOOS != "linux" {
+	if runtime.GOOS != "linux" && runtime.GOOS != "android" {
 		// Don't try to read Linux-specific /proc files or
 		// warn about them not existing.
 		return
