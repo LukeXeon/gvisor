@@ -131,6 +131,9 @@ type StackLayout struct {
 
 	// EnvvEnd is the end of the environment vector.
 	EnvvEnd hostarch.Addr
+
+	// AuxvStart is the first auxiliary-vector key on the user stack.
+	AuxvStart hostarch.Addr
 }
 
 // Load pushes the given args, env and aux vector to the stack using the
@@ -199,6 +202,7 @@ func (s *Stack) Load(args []string, env []string, aux Auxv) (StackLayout, error)
 	if err != nil {
 		return StackLayout{}, err
 	}
+	l.AuxvStart = s.Bottom
 
 	// Push environment.
 	_, err = s.pushAddrSliceAndTerminator(envAddrs)

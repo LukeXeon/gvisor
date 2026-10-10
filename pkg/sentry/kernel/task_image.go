@@ -24,6 +24,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel/futex"
 	"gvisor.dev/gvisor/pkg/sentry/loader"
 	"gvisor.dev/gvisor/pkg/sentry/mm"
+	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/syserr"
 )
 
@@ -50,6 +51,10 @@ type TaskImage struct {
 
 	// st is the task's syscall table.
 	st *SyscallTable `state:".(syscallTableInfo)"`
+
+	// These are consumed before the new image becomes runnable.
+	execFD          *vfs.FileDescription `state:"nosave"`
+	execFDValueAddr hostarch.Addr        `state:"nosave"`
 }
 
 // release releases all resources held by the TaskImage. release is called by
@@ -60,6 +65,10 @@ func (image *TaskImage) release(ctx context.Context) {
 	if image.MemoryManager != nil {
 		image.MemoryManager.DecUsers(ctx)
 		image.MemoryManager = nil
+	}
+	if image.execFD != nil {
+		image.execFD.DecRef(ctx)
+		image.execFD = nil
 	}
 	image.fu = nil
 }
@@ -147,12 +156,18 @@ func (k *Kernel) LoadTaskImage(ctx context.Context, args loader.LoadArgs) (*Task
 	}
 	defer m.DecUsers(ctx)
 	args.MemoryManager = m
+	args.BinaryFormats = k.binaryFormats
 	args.StartupTimeline.Reached("memory manager created")
 
 	info, creds, secureExec, err := loader.Load(ctx, args, k.extraAuxv, k.vdso)
 	if err != nil {
 		return nil, nil, false, err
 	}
+	defer func() {
+		if info.ExecFD != nil {
+			info.ExecFD.DecRef(ctx)
+		}
+	}()
 
 	// Lookup our new syscall table.
 	st, ok := LookupSyscallTable(info.OS, info.Arch.Arch())
@@ -165,11 +180,15 @@ func (k *Kernel) LoadTaskImage(ctx context.Context, args loader.LoadArgs) (*Task
 	if !m.IncUsers() {
 		panic("Failed to increment users count on new MM")
 	}
-	return &TaskImage{
-		Name:          info.Name,
-		Arch:          info.Arch,
-		MemoryManager: m,
-		fu:            k.futexes.Fork(),
-		st:            st,
-	}, creds, secureExec, nil
+	image := &TaskImage{
+		Name:            info.Name,
+		Arch:            info.Arch,
+		MemoryManager:   m,
+		fu:              k.futexes.Fork(),
+		st:              st,
+		execFD:          info.ExecFD,
+		execFDValueAddr: info.ExecFDValueAddr,
+	}
+	info.ExecFD = nil
+	return image, creds, secureExec, nil
 }
