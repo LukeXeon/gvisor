@@ -17,6 +17,7 @@ package hostmm
 import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/hostcompat"
 	"gvisor.dev/gvisor/pkg/log"
 )
 
@@ -52,7 +53,7 @@ func (h HostMemBarrier) GlobalMemoryBarrier() error {
 	if !h.global {
 		panic("hostmm: GlobalMemoryBarrier called, but host does not support it")
 	}
-	if _, _, e := unix.Syscall(unix.SYS_MEMBARRIER, linux.MEMBARRIER_CMD_GLOBAL, 0 /* flags */, 0 /* unused */); e != 0 {
+	if _, _, e := hostcompat.Syscall(unix.SYS_MEMBARRIER, linux.MEMBARRIER_CMD_GLOBAL, 0 /* flags */, 0 /* unused */); e != 0 {
 		return e
 	}
 	return nil
@@ -67,7 +68,7 @@ func (h HostMemBarrier) ProcessMemoryBarrier() error {
 	if !h.privateExpedited {
 		panic("hostmm: ProcessMemoryBarrier called unexpectedly")
 	}
-	if _, _, e := unix.RawSyscall(unix.SYS_MEMBARRIER, linux.MEMBARRIER_CMD_PRIVATE_EXPEDITED, 0 /* flags */, 0 /* unused */); e != 0 {
+	if _, _, e := hostcompat.RawSyscall(unix.SYS_MEMBARRIER, linux.MEMBARRIER_CMD_PRIVATE_EXPEDITED, 0 /* flags */, 0 /* unused */); e != 0 {
 		return e
 	}
 	return nil
@@ -83,6 +84,7 @@ func (h HostMemBarrier) ProcessMemoryBarrier() error {
 // while we determine this, which can take tens of milliseconds.
 func Probe(probePrivateExpedited bool) <-chan HostMemBarrier {
 	ch := make(chan HostMemBarrier, 1)
+
 	go func() {
 		ch <- probe(probePrivateExpedited)
 		close(ch)
@@ -92,7 +94,7 @@ func Probe(probePrivateExpedited bool) <-chan HostMemBarrier {
 
 func probe(probePrivateExpedited bool) HostMemBarrier {
 	var mb HostMemBarrier
-	supported, _, e := unix.RawSyscall(unix.SYS_MEMBARRIER, linux.MEMBARRIER_CMD_QUERY, 0 /* flags */, 0 /* unused */)
+	supported, _, e := hostcompat.RawSyscall(unix.SYS_MEMBARRIER, linux.MEMBARRIER_CMD_QUERY, 0 /* flags */, 0 /* unused */)
 	if e != 0 {
 		if e != unix.ENOSYS {
 			log.Warningf("membarrier(MEMBARRIER_CMD_QUERY) failed: %s", e.Error())
@@ -108,7 +110,7 @@ func probe(probePrivateExpedited bool) HostMemBarrier {
 	// Registering a  process for private-expedited membarrier blocks on an RCU
 	// grace period (tens of ms), so only do it if needed.
 	if req := uintptr(linux.MEMBARRIER_CMD_PRIVATE_EXPEDITED | linux.MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED); supported&req == req {
-		if _, _, e := unix.RawSyscall(unix.SYS_MEMBARRIER, linux.MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED, 0 /* flags */, 0 /* unused */); e != 0 {
+		if _, _, e := hostcompat.RawSyscall(unix.SYS_MEMBARRIER, linux.MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED, 0 /* flags */, 0 /* unused */); e != 0 {
 			log.Warningf("membarrier(MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED) failed: %s", e.Error())
 		} else {
 			mb.privateExpedited = true
