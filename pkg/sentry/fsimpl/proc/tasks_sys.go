@@ -153,6 +153,8 @@ func sysSubdirs(path string) []string {
 		return []string{"kernel", "fs", "vm", "user", "net"}
 	case "kernel":
 		return []string{"random", "yama", "keys"}
+	case "fs":
+		return []string{"binfmt_misc"}
 	case "net":
 		return []string{"ipv4", "core", "ipv6"}
 	case "net/ipv4", "net/ipv6":
