@@ -93,6 +93,9 @@ func (fs *filesystem) newLazySysDir(ctx context.Context, creds *auth.Credentials
 	})
 	d.InitRefs()
 	d.OrderedChildren.Init(kernfs.OrderedChildrenOptions{})
+	if d.IsEmptyDir() {
+		d.populated.Store(true)
+	}
 	// Set the link count of the populated directory now, so that Stat does
 	// not need to populate d.
 	d.IncLinks(uint32(len(sysSubdirs(path))))
@@ -133,8 +136,13 @@ func (d *lazySysDir) Open(ctx context.Context, rp *vfs.ResolvingPath, kd *kernfs
 
 // HasChildren implements kernfs.Inode.HasChildren.
 func (d *lazySysDir) HasChildren() bool {
-	// Every lazySysDir has children once populated.
 	return !d.populated.Load() || d.StaticDirectory.HasChildren()
+}
+
+// IsEmptyDir implements the kernfs mount visibility contract. binfmt_misc
+// entries belong to the mounted filesystem, never to the underlying procfs.
+func (d *lazySysDir) IsEmptyDir() bool {
+	return d.path == "fs/binfmt_misc"
 }
 
 // newSysDir returns the inode for the /proc/sys directory.
