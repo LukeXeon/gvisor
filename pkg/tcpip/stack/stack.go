@@ -214,6 +214,10 @@ type Stack struct {
 	// during save/restore.
 	allowLiveTCPMigration bool `state:"nosave"`
 
+	// excludeFromSave is set for stacks that are never saved. It is
+	// immutable after New.
+	excludeFromSave bool `state:"nosave"`
+
 	// externalNetworkingDisabled indicates whether external networking is
 	// disabled. This means all non-loopback NICs are disabled.
 	externalNetworkingDisabled bool
@@ -286,6 +290,12 @@ type Options struct {
 	// If false, any connected TCP endpoints will be terminated
 	// during save/restore.
 	AllowLiveTCPMigration bool
+
+	// ExcludeFromSave indicates that the stack is not saved and restored
+	// with the sandbox, such as a process-local stack that relays traffic
+	// to the host. Its closed endpoints are not added to the process-wide
+	// dangling endpoint set, which is saved with the kernel.
+	ExcludeFromSave bool
 
 	// RandSource is an optional source to use to generate random
 	// numbers. If omitted it defaults to a Source seeded by the data
@@ -482,6 +492,7 @@ func New(opts Options) *Stack {
 		tcpInvalidRateLimit:   defaultTCPInvalidRateLimit,
 		tsOffsetSecret:        secureRNG.Uint32(),
 		allowLiveTCPMigration: opts.AllowLiveTCPMigration,
+		excludeFromSave:       opts.ExcludeFromSave,
 	}
 	s.SetNFTables(opts.NFTables)
 
@@ -2903,6 +2914,11 @@ func (s *Stack) AllowLiveTCPMigration() bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.allowLiveTCPMigration
+}
+
+// ExcludedFromSave returns true if the stack is not saved with the sandbox.
+func (s *Stack) ExcludedFromSave() bool {
+	return s.excludeFromSave
 }
 
 // SetAllowLiveTCPMigration sets if TCP connections can be migrated.
