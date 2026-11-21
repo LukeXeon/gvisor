@@ -89,6 +89,13 @@ type FilesystemOptions struct {
 	// LowerRoots contains the roots of the immutable lower layers of the
 	// overlay. LowerRoots is immutable.
 	LowerRoots []vfs.VirtualDentry
+
+	// If OCIWhiteouts is true, whiteouts in all layers use the OCI image layer
+	// (AUFS) format: the whiteout for X is an empty regular file named .wh.X,
+	// rather than a character device with device number 0. Names with the
+	// .wh. prefix are reserved. Opaque directories still use the overlay
+	// xattr. OCIWhiteouts is immutable.
+	OCIWhiteouts bool
 }
 
 // filesystem implements vfs.FilesystemImpl.
@@ -448,6 +455,10 @@ func (fstype FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 		if err := fs.updateMaxNameLen(ctx, creds, vfsObj, lowerRoot); err != nil {
 			ctx.Debugf("overlay.FilesystemType.GetFilesystem: failed to StatFSAt on lower layer root: %v", err)
 		}
+	}
+	if fsopts.OCIWhiteouts {
+		// Every file name must leave room for its whiteout.
+		fs.maxFilenameLen -= uint64(len(ociWhiteoutPrefix))
 	}
 
 	// Construct the root dentry.
