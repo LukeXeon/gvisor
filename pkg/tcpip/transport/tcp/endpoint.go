@@ -1157,7 +1157,9 @@ func (e *Endpoint) closeNoShutdownLocked() {
 
 	// Mark endpoint as closed.
 	e.closed = true
-	tcpip.AddDanglingEndpoint(e)
+	if !e.stack.ExcludedFromSave() {
+		tcpip.AddDanglingEndpoint(e)
+	}
 
 	eventMask := waiter.ReadableEvents | waiter.WritableEvents
 
