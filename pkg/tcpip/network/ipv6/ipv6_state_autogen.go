@@ -54,6 +54,31 @@ func (i *icmpv6DestinationNetworkUnreachableSockError) StateLoad(ctx context.Con
 	stateSourceObject.Load(0, &i.icmpv6DestinationUnreachableSockError)
 }
 
+func (i *icmpv6DestinationProhibitedSockError) StateTypeName() string {
+	return "pkg/tcpip/network/ipv6.icmpv6DestinationProhibitedSockError"
+}
+
+func (i *icmpv6DestinationProhibitedSockError) StateFields() []string {
+	return []string{
+		"icmpv6DestinationUnreachableSockError",
+	}
+}
+
+func (i *icmpv6DestinationProhibitedSockError) beforeSave() {}
+
+// +checklocksignore
+func (i *icmpv6DestinationProhibitedSockError) StateSave(stateSinkObject state.Sink) {
+	i.beforeSave()
+	stateSinkObject.Save(0, &i.icmpv6DestinationUnreachableSockError)
+}
+
+func (i *icmpv6DestinationProhibitedSockError) afterLoad(context.Context) {}
+
+// +checklocksignore
+func (i *icmpv6DestinationProhibitedSockError) StateLoad(ctx context.Context, stateSourceObject state.Source) {
+	stateSourceObject.Load(0, &i.icmpv6DestinationUnreachableSockError)
+}
+
 func (i *icmpv6DestinationPortUnreachableSockError) StateTypeName() string {
 	return "pkg/tcpip/network/ipv6.icmpv6DestinationPortUnreachableSockError"
 }
@@ -1016,6 +1041,7 @@ func (m *multiCounterICMPv6Stats) StateLoad(ctx context.Context, stateSourceObje
 func init() {
 	state.RegisterNoHooks((*icmpv6DestinationUnreachableSockError)(nil))
 	state.RegisterNoHooks((*icmpv6DestinationNetworkUnreachableSockError)(nil))
+	state.RegisterNoHooks((*icmpv6DestinationProhibitedSockError)(nil))
 	state.RegisterNoHooks((*icmpv6DestinationPortUnreachableSockError)(nil))
 	state.RegisterNoHooks((*icmpv6DestinationAddressUnreachableSockError)(nil))
 	state.RegisterNoHooks((*icmpv6PacketTooBigSockError)(nil))
