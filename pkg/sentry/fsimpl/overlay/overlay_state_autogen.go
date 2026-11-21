@@ -75,6 +75,8 @@ func (f *FilesystemOptions) StateFields() []string {
 	return []string{
 		"UpperRoot",
 		"LowerRoots",
+		"OCIWhiteouts",
+		"MaxCachedDentries",
 	}
 }
 
@@ -85,6 +87,8 @@ func (f *FilesystemOptions) StateSave(stateSinkObject state.Sink) {
 	f.beforeSave()
 	stateSinkObject.Save(0, &f.UpperRoot)
 	stateSinkObject.Save(1, &f.LowerRoots)
+	stateSinkObject.SaveBool(2, &f.OCIWhiteouts)
+	stateSinkObject.SaveUint64(3, &f.MaxCachedDentries)
 }
 
 func (f *FilesystemOptions) afterLoad(context.Context) {}
@@ -93,6 +97,8 @@ func (f *FilesystemOptions) afterLoad(context.Context) {}
 func (f *FilesystemOptions) StateLoad(ctx context.Context, stateSourceObject state.Source) {
 	stateSourceObject.Load(0, &f.UpperRoot)
 	stateSourceObject.Load(1, &f.LowerRoots)
+	stateSourceObject.LoadBool(2, &f.OCIWhiteouts)
+	stateSourceObject.LoadUint64(3, &f.MaxCachedDentries)
 }
 
 func (fs *filesystem) StateTypeName() string {
