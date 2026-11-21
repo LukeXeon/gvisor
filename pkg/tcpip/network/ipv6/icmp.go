@@ -66,6 +66,32 @@ func (*icmpv6DestinationNetworkUnreachableSockError) Kind() stack.TransportError
 	return stack.DestinationNetworkUnreachableTransportError
 }
 
+var _ stack.TransportError = (*icmpv6DestinationProhibitedSockError)(nil)
+
+// icmpv6DestinationProhibitedSockError is an ICMPv6 Destination Unreachable
+// error with the Communication with Destination Administratively Prohibited
+// code.
+//
+// It indicates that a packet was blocked by a firewall or another policy.
+//
+// +stateify savable
+type icmpv6DestinationProhibitedSockError struct {
+	icmpv6DestinationUnreachableSockError
+}
+
+// Code implements tcpip.SockErrorCause.
+func (*icmpv6DestinationProhibitedSockError) Code() uint8 {
+	return uint8(header.ICMPv6Prohibited)
+}
+
+// Kind implements stack.TransportError.
+//
+// Administratively prohibited is reported as host unreachable, like the
+// equivalent ICMPv4 codes.
+func (*icmpv6DestinationProhibitedSockError) Kind() stack.TransportErrorKind {
+	return stack.DestinationHostUnreachableTransportError
+}
+
 var _ stack.TransportError = (*icmpv6DestinationPortUnreachableSockError)(nil)
 
 // icmpv6DestinationPortUnreachableSockError is an ICMPv6 Destination Port
@@ -337,6 +363,10 @@ func (e *endpoint) handleICMP(pkt *stack.PacketBuffer, hasFragmentHeader bool, r
 		switch h.Code() {
 		case header.ICMPv6NetworkUnreachable:
 			e.handleControl(&icmpv6DestinationNetworkUnreachableSockError{}, pkt)
+		case header.ICMPv6Prohibited:
+			e.handleControl(&icmpv6DestinationProhibitedSockError{}, pkt)
+		case header.ICMPv6AddressUnreachable:
+			e.handleControl(&icmpv6DestinationAddressUnreachableSockError{}, pkt)
 		case header.ICMPv6PortUnreachable:
 			e.handleControl(&icmpv6DestinationPortUnreachableSockError{}, pkt)
 		}
