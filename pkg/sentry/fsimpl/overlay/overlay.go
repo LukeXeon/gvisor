@@ -96,6 +96,14 @@ type FilesystemOptions struct {
 	// .wh. prefix are reserved. Opaque directories still use the overlay
 	// xattr. OCIWhiteouts is immutable.
 	OCIWhiteouts bool
+
+	// MaxCachedDentries is the number of dentries without references that the
+	// filesystem keeps for later path resolution, most recently released
+	// first. If it is zero, a dentry is destroyed when its last reference is
+	// dropped, and every resolution looks the name up in each layer again.
+	// Caching relies on the layers changing only through the overlay.
+	// MaxCachedDentries is immutable.
+	MaxCachedDentries uint64
 }
 
 // filesystem implements vfs.FilesystemImpl.
@@ -161,6 +169,15 @@ type filesystem struct {
 	// stackDepth is the 1-based overlay stacking depth of this filesystem,
 	// analogous to Linux's super_block.s_stack_depth. stackDepth is immutable.
 	stackDepth int
+
+	// cachedHead and cachedTail are the most and least recently released
+	// dentries kept by opts.MaxCachedDentries, linked through
+	// dentry.cachedNext and dentry.cachedPrev; cachedLen is their number.
+	// PrepareSave empties the list. They are protected by renameMu held for
+	// writing.
+	cachedHead *dentry `state:"nosave"`
+	cachedTail *dentry `state:"nosave"`
+	cachedLen  uint64  `state:"nosave"`
 }
 
 func layerStackDepth(vd vfs.VirtualDentry) int {
@@ -584,6 +601,9 @@ func clonePrivateMount(ctx context.Context, vfsObj *vfs.VirtualFilesystem, creds
 
 // Release implements vfs.FilesystemImpl.Release.
 func (fs *filesystem) Release(ctx context.Context) {
+	fs.renameMu.Lock()
+	fs.evictAllLocked(ctx)
+	fs.renameMu.Unlock()
 	vfsObj := fs.vfsfs.VirtualFilesystem()
 	vfsObj.PutAnonBlockDevMinor(fs.dirDevMinor)
 	for _, lowerDevMinor := range fs.lowerDevMinors {
@@ -717,6 +737,13 @@ type dentry struct {
 	dirMu    dirMutex `state:"nosave"`
 	children map[string]*dentry
 	dirents  []vfs.Dirent
+
+	// If cached is true, d is in filesystem's list of cached dentries; it may
+	// have regained references since. cached, cachedPrev, and cachedNext are
+	// protected by filesystem.renameMu held for writing.
+	cached     bool    `state:"nosave"`
+	cachedPrev *dentry `state:"nosave"`
+	cachedNext *dentry `state:"nosave"`
 
 	// upperVD and lowerVDs are the files from the overlay filesystem's layers
 	// that comprise the file on the overlay filesystem.
@@ -886,8 +913,72 @@ func (d *dentry) checkDropLocked(ctx context.Context) {
 		return
 	}
 
-	// Refs is still zero; destroy it.
-	d.destroyLocked(ctx)
+	if d.vfsd.IsDead() || d.fs.opts.MaxCachedDentries == 0 {
+		d.uncacheLocked()
+		d.destroyLocked(ctx)
+		return
+	}
+	// Keep d for later lookups, evicting the least recently released
+	// dentries beyond the limit.
+	d.uncacheLocked()
+	d.cached = true
+	d.cachedNext = d.fs.cachedHead
+	if d.cachedNext != nil {
+		d.cachedNext.cachedPrev = d
+	} else {
+		d.fs.cachedTail = d
+	}
+	d.fs.cachedHead = d
+	d.fs.cachedLen++
+	for d.fs.cachedLen > d.fs.opts.MaxCachedDentries {
+		d.fs.evictLocked(ctx)
+	}
+}
+
+// uncacheLocked removes d from its filesystem's cached dentries if it is
+// there.
+//
+// Preconditions: d.fs.renameMu must be locked for writing.
+func (d *dentry) uncacheLocked() {
+	if !d.cached {
+		return
+	}
+	if d.cachedPrev != nil {
+		d.cachedPrev.cachedNext = d.cachedNext
+	} else {
+		d.fs.cachedHead = d.cachedNext
+	}
+	if d.cachedNext != nil {
+		d.cachedNext.cachedPrev = d.cachedPrev
+	} else {
+		d.fs.cachedTail = d.cachedPrev
+	}
+	d.cached, d.cachedPrev, d.cachedNext = false, nil, nil
+	d.fs.cachedLen--
+}
+
+// evictLocked removes the least recently released cached dentry and destroys
+// it unless it regained references. Destroying it may cache its parent.
+//
+// Preconditions:
+//   - fs.renameMu must be locked for writing.
+//   - fs.cachedLen != 0.
+func (fs *filesystem) evictLocked(ctx context.Context) {
+	victim := fs.cachedTail
+	victim.uncacheLocked()
+	if victim.refs.Load() == 0 {
+		victim.destroyLocked(ctx)
+	}
+}
+
+// evictAllLocked destroys every cached dentry without references, including
+// the parents that this releases.
+//
+// Preconditions: fs.renameMu must be locked for writing.
+func (fs *filesystem) evictAllLocked(ctx context.Context) {
+	for fs.cachedLen != 0 {
+		fs.evictLocked(ctx)
+	}
 }
 
 // destroyLocked destroys the dentry.

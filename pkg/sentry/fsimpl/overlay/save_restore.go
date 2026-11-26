@@ -17,9 +17,29 @@ package overlay
 import (
 	"context"
 
+	sentrycontext "gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
+
+// PrepareSave implements vfs.FilesystemImplSaveRestoreExtension.PrepareSave.
+// Cached dentries are not saved: the list that holds them is not, and a
+// restored filesystem resolves their names again.
+func (fs *filesystem) PrepareSave(ctx sentrycontext.Context, _ vfs.PrepareSaveOptions) error {
+	fs.renameMu.Lock()
+	defer fs.renameMu.Unlock()
+	fs.evictAllLocked(ctx)
+	return nil
+}
+
+// BeforeResume implements vfs.FilesystemImplSaveRestoreExtension.BeforeResume.
+func (fs *filesystem) BeforeResume(sentrycontext.Context) {}
+
+// CompleteRestore implements
+// vfs.FilesystemImplSaveRestoreExtension.CompleteRestore.
+func (fs *filesystem) CompleteRestore(sentrycontext.Context, vfs.CompleteRestoreOptions) error {
+	return nil
+}
 
 func (d *dentry) afterLoad(context.Context) {
 	if d.refs.Load() != -1 {
