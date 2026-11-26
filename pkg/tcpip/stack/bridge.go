@@ -68,27 +68,30 @@ func (p *bridgePort) DeliverNetworkPacket(protocol tcpip.NetworkProtocolNumber, 
 	}
 	destAddress := eth.DestinationAddress()
 	isMulticast := header.IsMulticastEthernetAddress(destAddress)
-	if entry, exist := bridge.fdbTable[BridgeFDBKey(destAddress)]; !exist {
-		// When no FDB entry is found, send the packet to all ports.
-		for _, port := range bridge.ports {
-			if p == port {
-				continue
+	isLocalUnicast := !isMulticast && (destAddress == bridge.addr || destAddress == p.nic.LinkAddress())
+	if !isLocalUnicast {
+		if entry, exist := bridge.fdbTable[BridgeFDBKey(destAddress)]; !exist {
+			// When no FDB entry is found, send the packet to all ports.
+			for _, port := range bridge.ports {
+				if p == port {
+					continue
+				}
+				newPkt := NewPacketBuffer(PacketBufferOptions{
+					ReserveHeaderBytes: int(port.nic.MaxHeaderLength()),
+					Payload:            pkt.ToBuffer(),
+				})
+				port.nic.writeRawPacket(newPkt)
+				newPkt.DecRef()
 			}
+		} else if entry.port != p {
+			destPort := entry.port
 			newPkt := NewPacketBuffer(PacketBufferOptions{
-				ReserveHeaderBytes: int(port.nic.MaxHeaderLength()),
+				ReserveHeaderBytes: int(destPort.nic.MaxHeaderLength()),
 				Payload:            pkt.ToBuffer(),
 			})
-			port.nic.writeRawPacket(newPkt)
+			destPort.nic.writeRawPacket(newPkt)
 			newPkt.DecRef()
 		}
-	} else if entry.port != p {
-		destPort := entry.port
-		newPkt := NewPacketBuffer(PacketBufferOptions{
-			ReserveHeaderBytes: int(destPort.nic.MaxHeaderLength()),
-			Payload:            pkt.ToBuffer(),
-		})
-		destPort.nic.writeRawPacket(newPkt)
-		newPkt.DecRef()
 	}
 
 	d := bridge.dispatcher
@@ -144,6 +147,20 @@ type BridgeEndpoint struct {
 	maxHeaderLength atomicbitops.Uint32
 }
 
+func writePacketToPort(p *bridgePort, pkt *PacketBuffer) {
+	// In order to properly loop back to the inbound side we must create a
+	// fresh packet that only contains the underlying payload with no headers
+	// or struct fields set.
+	newPkt := NewPacketBuffer(PacketBufferOptions{
+		Payload:            pkt.ToBuffer(),
+		ReserveHeaderBytes: int(p.nic.MaxHeaderLength()),
+	})
+	newPkt.EgressRoute = pkt.EgressRoute
+	newPkt.NetworkProtocolNumber = pkt.NetworkProtocolNumber
+	p.nic.writePacket(newPkt)
+	newPkt.DecRef()
+}
+
 // WritePackets implements stack.LinkEndpoint.WritePackets.
 func (b *BridgeEndpoint) WritePackets(pkts PacketBufferList) (int, tcpip.Error) {
 	b.mu.RLock()
@@ -151,19 +168,16 @@ func (b *BridgeEndpoint) WritePackets(pkts PacketBufferList) (int, tcpip.Error) 
 
 	pktsSlice := pkts.AsSlice()
 	n := len(pktsSlice)
-	for _, p := range b.ports {
-		for _, pkt := range pktsSlice {
-			// In order to properly loop back to the inbound side we must create a
-			// fresh packet that only contains the underlying payload with no headers
-			// or struct fields set.
-			newPkt := NewPacketBuffer(PacketBufferOptions{
-				Payload:            pkt.ToBuffer(),
-				ReserveHeaderBytes: int(p.nic.MaxHeaderLength()),
-			})
-			newPkt.EgressRoute = pkt.EgressRoute
-			newPkt.NetworkProtocolNumber = pkt.NetworkProtocolNumber
-			p.nic.writePacket(newPkt)
-			newPkt.DecRef()
+	for _, pkt := range pktsSlice {
+		dst := pkt.EgressRoute.RemoteLinkAddress
+		if !header.IsMulticastEthernetAddress(dst) {
+			if entry, ok := b.fdbTable[BridgeFDBKey(dst)]; ok && entry.port != nil {
+				writePacketToPort(entry.port, pkt)
+				continue
+			}
+		}
+		for _, p := range b.ports {
+			writePacketToPort(p, pkt)
 		}
 	}
 
