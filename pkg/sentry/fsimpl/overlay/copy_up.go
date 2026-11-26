@@ -162,8 +162,14 @@ func (d *dentry) copyUpMaybeSyntheticMountpointLocked(ctx context.Context, forSy
 			return err
 		}
 		defer oldFD.DecRef(ctx)
+		flags := uint32(linux.O_WRONLY | linux.O_CREAT | linux.O_EXCL)
+		if d.wrappedMappable != nil {
+			// ConfigureMMap below switches existing lower mappings onto the
+			// upper file, which requires a readable upper FD.
+			flags = linux.O_RDWR | linux.O_CREAT | linux.O_EXCL
+		}
 		newFD, err := vfsObj.OpenAt(ctx, d.fs.creds, &newpop, &vfs.OpenOptions{
-			Flags: linux.O_WRONLY | linux.O_CREAT | linux.O_EXCL,
+			Flags: flags,
 			// d.mode can be read because d.copyMu is locked.
 			Mode: linux.FileMode(d.mode.RacyLoad() &^ linux.S_IFMT),
 		})
