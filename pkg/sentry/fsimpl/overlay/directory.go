@@ -37,7 +37,7 @@ func (d *dentry) collectWhiteoutsForRmdirLocked(ctx context.Context) (map[string
 	vfsObj := d.fs.vfsfs.VirtualFilesystem()
 	var readdirErr error
 	whiteouts := make(map[string]bool)
-	var maybeWhiteouts []string
+	var maybeWhiteouts, ociWhiteouts []string
 	d.iterLayers(func(layerVD vfs.VirtualDentry, isUpper bool) bool {
 		layerFD, err := vfsObj.OpenAt(ctx, d.fs.creds, &vfs.PathOperation{
 			Root:  layerVD,
@@ -54,8 +54,14 @@ func (d *dentry) collectWhiteoutsForRmdirLocked(ctx context.Context) (map[string
 		// Reuse slice allocated for maybeWhiteouts from a previous layer to
 		// reduce allocations.
 		maybeWhiteouts = maybeWhiteouts[:0]
+		ociWhiteouts = ociWhiteouts[:0]
 		err = layerFD.IterDirents(ctx, vfs.IterDirentsCallbackFunc(func(dirent vfs.Dirent) error {
 			if dirent.Name == "." || dirent.Name == ".." {
+				return nil
+			}
+			if name, ok := d.fs.ociWhiteoutTarget(dirent.Name); ok {
+				// The whiteout applies to layers below this one.
+				ociWhiteouts = append(ociWhiteouts, name)
 				return nil
 			}
 			if _, ok := whiteouts[dirent.Name]; ok {
@@ -93,6 +99,11 @@ func (d *dentry) collectWhiteoutsForRmdirLocked(ctx context.Context) (map[string
 				return false
 			}
 			whiteouts[maybeWhiteoutName] = isUpper
+		}
+		for _, name := range ociWhiteouts {
+			if _, ok := whiteouts[name]; !ok {
+				whiteouts[name] = isUpper
+			}
 		}
 		// Continue iteration since we haven't found any non-whiteout files in
 		// this directory yet.
@@ -185,6 +196,7 @@ func (d *dentry) getDirentsLocked(ctx context.Context) ([]vfs.Dirent, error) {
 	var readdirErr error
 	prevDirents := make(map[string]struct{})
 	var maybeWhiteouts []vfs.Dirent
+	var ociWhiteouts []string
 	d.iterLayers(func(layerVD vfs.VirtualDentry, isUpper bool) bool {
 		layerFD, err := vfsObj.OpenAt(ctx, d.fs.creds, &vfs.PathOperation{
 			Root:  layerVD,
@@ -201,8 +213,14 @@ func (d *dentry) getDirentsLocked(ctx context.Context) ([]vfs.Dirent, error) {
 		// Reuse slice allocated for maybeWhiteouts from a previous layer to
 		// reduce allocations.
 		maybeWhiteouts = maybeWhiteouts[:0]
+		ociWhiteouts = ociWhiteouts[:0]
 		err = layerFD.IterDirents(ctx, vfs.IterDirentsCallbackFunc(func(dirent vfs.Dirent) error {
 			if dirent.Name == "." || dirent.Name == ".." {
+				return nil
+			}
+			if name, ok := d.fs.ociWhiteoutTarget(dirent.Name); ok {
+				// The whiteout hides name on layers below this one.
+				ociWhiteouts = append(ociWhiteouts, name)
 				return nil
 			}
 			if _, ok := prevDirents[dirent.Name]; ok {
@@ -242,6 +260,9 @@ func (d *dentry) getDirentsLocked(ctx context.Context) ([]vfs.Dirent, error) {
 			}
 			dirent.NextOff = int64(len(dirents) + 1)
 			dirents = append(dirents, dirent)
+		}
+		for _, name := range ociWhiteouts {
+			prevDirents[name] = struct{}{}
 		}
 		return true
 	})
